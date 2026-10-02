@@ -379,7 +379,6 @@ static void emit_octa(void)
 {
     vec3_t top = v3(0, 0.5f, 0), bot = v3(0, -0.5f, 0);
     vec3_t ring[4] = { v3(0.5f, 0, 0), v3(0, 0, 0.5f), v3(-0.5f, 0, 0), v3(0, 0, -0.5f) };
-    mb_reset();
     for (int i = 0; i < 4; i++) {
         vec3_t a = ring[i], b = ring[(i + 1) & 3];
         vec3_t nt = v3_norm(v3_add(v3_add(a, b), top));

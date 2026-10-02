@@ -120,18 +120,23 @@ static human_lists_t HL[MDL_HUMAN_COUNT];
 
 static void emit_weapon(const human_desc_t *d, float arm_len, float H, bool cast)
 {
-    /* the weapon hangs from the fist: (0, -arm_len) in arm space, tilted forward */
-    float tilt = cast ? 0.0f : -80.0f * PI_F / 180.0f;
+    /* The weapon is held in the fist at (0, -arm_len) in arm space. tilt is
+       the angle of its axis from the arm's "up" (towards the shoulder) to the
+       front: at rest staffs and spears stand upright beside the body and
+       swords point down and forward; when casting or striking the weapon
+       continues the line of the arm. */
+    float tilt = cast ? PI_F : (d->weapon == W_SWORD ? 2.5f : 0.15f);
     float ct = cosf(tilt), st = sinf(tilt);
     /* place a part at (u along weapon axis) relative to the fist */
-    #define AT(u) 0.0f, -arm_len + (u) * ct, 0.02f + (u) * st
+    #define AT(u) 0.0f, -arm_len + (u) * ct, 0.03f + (u) * st
     switch (d->weapon) {
     case W_STAFF:
     case W_STAFF_GEM: {
-        float len = H * 0.95f;
-        PR(PRIM_CYLINDER, 0x7A5432FF, AT(-len * 0.35f), tilt, 0, 0, 0.06f, len, 0.06f);
+        /* gripped a third of the way up; nearer the butt when pointing it */
+        float len = H * 0.95f, grip = cast ? 0.2f : 0.35f;
+        PR(PRIM_CYLINDER, 0x7A5432FF, AT(-len * grip), tilt, 0, 0, 0.06f, len, 0.06f);
         uint32_t gem = d->weapon == W_STAFF_GEM ? 0x50A0FFFF : 0xE0C070FF;
-        P(PRIM_OCTA, gem, AT(len * 0.65f + 0.04f), 0.14f, 0.18f, 0.14f);
+        PR(PRIM_OCTA, gem, AT(len * (1.0f - grip) + 0.04f), tilt, 0, 0, 0.14f, 0.18f, 0.14f);
         break;
     }
     case W_SWORD:
@@ -305,7 +310,7 @@ void draw_human(human_model_t m, vec3_t pos, float yaw, anim_t anim, float t, fl
     /* the model faces +Z, so its right hand is on -X */
     glPushMatrix();
     mult_joint(-L->arm_x, L->sh_y, 0, r_spread, r_arm);
-    dl_call(anim == ANIM_CAST ? L->arm_r_cast : L->arm_r);
+    dl_call(anim == ANIM_CAST || anim == ANIM_SWING ? L->arm_r_cast : L->arm_r);
     glPopMatrix();
     glPushMatrix();
     mult_joint(L->arm_x, L->sh_y, 0, -l_spread, l_arm);

@@ -109,6 +109,32 @@ static const tin_t SCRIPT[] = {
     { 9.0f, 11.45f, TB_R },
     { 18.0f, 18.1f, TB_A }, { 19.0f, 19.1f, TB_A }, { 20.0f, 20.1f, TB_A }, { 21.0f, 21.1f, TB_A },
 };
+#elif TEST_INPUT == 8
+/* close-ups of Rudeus: front, three-quarter, side, then casting */
+static void rudy_at(float dx, float dz)
+{
+    g_player.pos = v3(-6, world_height(-6, 6), 6); g_player.yaw = 0;
+    g_cam.override = true;
+    g_cam.ov_pos = v3(-6 + dx, g_player.pos.y + 0.75f, 6 + dz);
+    g_cam.ov_target = v3(-6, g_player.pos.y + 0.55f, 6);
+}
+static void cam_front(void) { rudy_at(0, 2.0f); }
+static void cam_quarter(void) { rudy_at(1.4f, 1.4f); }
+static void cam_side(void) { rudy_at(-2.0f, 0.05f); }
+static void cam_cast(void) { rudy_at(1.6f, 1.2f); g_player.cast_t = 2.0f; }
+static void ruijerd(void)
+{
+    story_debug_start(22);
+    float y = world_height(1.5f, -5.0f);
+    g_cam.override = true;
+    g_cam.ov_pos = v3(2.6f, y + 1.3f, -2.6f);
+    g_cam.ov_target = v3(1.5f, y + 1.0f, -5.0f);
+}
+static const tin_t SCRIPT[] = {
+    { 0.5f, 0.6f, 0, 0, 0, cam_front }, { 3.0f, 3.1f, 0, 0, 0, cam_quarter },
+    { 5.5f, 5.6f, 0, 0, 0, cam_side }, { 8.0f, 8.1f, 0, 0, 0, cam_cast },
+    { 11.0f, 11.1f, 0, 0, 0, ruijerd },
+};
 #elif TEST_INPUT == 9
 /* texture check: look straight down at the ground, then straight at a wall */
 static void cam_down(void) { g_cam.override = true; g_cam.ov_pos = v3(-6, 9, 4.01f); g_cam.ov_target = v3(-6, 0, 4); }
