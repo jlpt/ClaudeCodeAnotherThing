@@ -28,10 +28,12 @@ assets_conv += filesystem/body.font64 filesystem/outline.font64 filesystem/title
 all: $(ROM)
 
 # World textures: 32x32 grayscale detail maps, tinted by vertex colour.
+# Mipmapped: trilinear filtering avoids shimmering, and with fog enabled the
+# RDP runs in 2-cycle mode and samples the second mip tile as well.
 filesystem/tex_%.sprite: assets/tex_%.png
 	@mkdir -p $(dir $@)
 	@echo "    [SPRITE] $@"
-	@$(N64_MKSPRITE) -f RGBA16 -o "$(dir $@)" "$<"
+	@$(N64_MKSPRITE) -f RGBA16 --mipmap BOX -o "$(dir $@)" "$<"
 
 # HUD discs: intensity+alpha so they can be tinted any colour.
 filesystem/ui_%.sprite: assets/ui_%.png

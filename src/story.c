@@ -131,6 +131,7 @@ static void show_card(const char *const *pages, int count, void (*done)(void))
 
 static void set_step(story_step_t s)
 {
+    debugf("story step %d -> %d\n", (int)step, (int)s);
     step = s;
     step_t = 0;
     sub = 0;

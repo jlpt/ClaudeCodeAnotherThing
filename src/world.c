@@ -18,6 +18,7 @@ static float heights[VERTS][VERTS];
 static uint32_t tcolors[VERTS][VERTS];
 static dlist_t chunk_lists[CHUNKS * CHUNKS], sky_list;
 static bool lists_ready;
+static bool lists_dirty;
 static bool baked_storm;
 static bool calamity;
 static tex_id_t ground_tex;
@@ -436,7 +437,7 @@ static uint32_t light_color(uint32_t base, vec3_t n)
     return ((uint32_t)cr << 24) | ((uint32_t)cg << 16) | ((uint32_t)cb << 8) | 0xFF;
 }
 
-static void build_terrain(void)
+static void compute_terrain(void)
 {
     for (int z = 0; z < VERTS; z++)
         for (int x = 0; x < VERTS; x++)
@@ -450,9 +451,13 @@ static void build_terrain(void)
             float wx = -MAP_HALF + x * CELL, wz = -MAP_HALF + z * CELL;
             tcolors[z][x] = light_color(shape_color(wx, wz, heights[z][x]), n);
         }
+}
 
+static void build_terrain(void)
+{
     /* each chunk is a 9x9 vertex grid drawn with indices, so every vertex is
        transformed once by the RSP instead of once per triangle */
+    gfx_bind(ground_tex);
     const int CV = CHUNK_CELLS + 1;
     static gfx_vtx_t verts[(CHUNK_CELLS + 1) * (CHUNK_CELLS + 1)];
     static uint16_t idx[CHUNK_CELLS * CHUNK_CELLS * 6];
@@ -484,6 +489,7 @@ static void build_terrain(void)
             gfx_draw_indexed(verts, CV * CV, idx, ni, true, false);
             chunk_lists[cz * CHUNKS + cx] = dl_end();
         }
+    gfx_bind(TEX_NONE);
 }
 
 static void build_sky(void)
@@ -752,11 +758,7 @@ void world_load(map_id_t id)
     case MAP_PLATEAU: paths = PLATEAU_PATHS; npaths = sizeof(PLATEAU_PATHS) / sizeof(seg_t); ground_tex = TEX_DIRT;  break;
     default:          paths = DEMON_PATHS;   npaths = sizeof(DEMON_PATHS) / sizeof(seg_t);   ground_tex = TEX_DIRT;  break;
     }
-    /* the GPU may still be drawing the previous map's lists */
-    rspq_wait();
-    build_terrain();
-    build_sky();
-    lists_ready = true;
+    compute_terrain();
 
     nprops = 0;
     switch (id) {
@@ -765,8 +767,21 @@ void world_load(map_id_t id)
     case MAP_PLATEAU: populate_plateau(); break;
     default:          populate_demon(); break;
     }
-    bake_props();
+    /* Display lists are recorded at the start of the next frame, inside the
+       GL context: lists recorded outside it came out broken (textures
+       sampled along a single axis, occasional RSP crashes). */
+    lists_dirty = true;
     baked_storm = false;
+}
+
+static void record_world_lists(void)
+{
+    rspq_wait();   /* the RSP may still be drawing the previous lists */
+    build_terrain();
+    build_sky();
+    bake_props();
+    lists_ready = true;
+    lists_dirty = false;
 }
 
 /* ------------------------------------------------------------------ */
@@ -943,8 +958,8 @@ void world_update(float dt)
     if (g_world.storm && !baked_storm) {
         /* the sun goes behind the clouds: re-light the terrain and props */
         baked_storm = true;
-        build_terrain();
-        bake_props();
+        compute_terrain();
+        lists_dirty = true;
     }
     if (g_world.storm) {
         g_world.storm_t += dt;
@@ -981,6 +996,7 @@ uint32_t world_clear_color(void)
 
 void world_render_sky(void)
 {
+    if (lists_dirty) record_world_lists();
     vec3_t eye = g_cam.override ? g_cam.ov_pos : g_cam.pos;
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_LIGHTING);
@@ -1116,6 +1132,7 @@ void bake_props(void)
     uint32_t sun = g_world.storm ? color_mul(g_world.sun_color, 0.35f) : g_world.sun_color;
     mb_bake_lighting(true, g_world.sun_dir, sun, g_world.ambient);
     mb_skip_bottoms(true);
+    gfx_bind(TEX_STONE);   /* texturing on while recording (see build_terrain) */
     for (int c = 0; c < CHUNKS * CHUNKS; c++) {
         for (int k = 0; k < NPASS; k++) {
             cur_pass = PASS_ORDER[k];
@@ -1142,6 +1159,7 @@ void bake_props(void)
     mb_base_identity();
     mb_skip_bottoms(false);
     mb_bake_lighting(false, g_world.sun_dir, 0, 0);
+    gfx_bind(TEX_NONE);
 }
 
 static bool chunk_visible(int cx, int cz)
