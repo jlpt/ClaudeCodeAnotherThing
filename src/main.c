@@ -464,7 +464,7 @@ int main(void)
         fps_acc += dt;
         fps_frames++;
         if (fps_acc >= 5.0f) {
-            debugf("fps %.1f state %d step %d\n", fps_frames / fps_acc, g_state, (int)g_save.step);
+            debugf("fps %.1f state %d step %d t=%.1f pos %.1f %.1f\n", fps_frames / fps_acc, g_state, (int)g_save.step, g_frame.time, g_player.pos.x, g_player.pos.z);
 #ifdef PERF_LOG
             debugf("  avg ms: update %.2f  render-cpu %.2f  gpu-wait %.2f\n",
                    TICKS_TO_US(perf_upd) / 1000.0f / fps_frames, TICKS_TO_US(perf_cpu) / 1000.0f / fps_frames,

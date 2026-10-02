@@ -561,7 +561,11 @@ static void begin_chapter_1(void)
 }
 static void after_intro(void) { game_fade_to(begin_chapter_1); }
 
-static void after_zenith_1(void) { set_step(ST_MEET_ROXY); }
+static void after_zenith_1(void)
+{
+    set_step(ST_MEET_ROXY);
+    npc_place(NPC_ROXY, MDL_ROXY, 0, 38, PI_F);
+}
 
 static void after_roxy_targets_tip(void)
 {

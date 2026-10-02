@@ -314,6 +314,8 @@ void camera_snap(void)
     g_cam.pos = cam_desired();
     float gh = world_height(g_cam.pos.x, g_cam.pos.z) + 0.8f;
     if (g_cam.pos.y < gh) g_cam.pos.y = gh;
+    camera_update(0.5f);   /* settle immediately, including collision */
+    g_cam.pos = g_cam.pos;
 }
 
 void camera_update(float dt)
@@ -344,6 +346,18 @@ void camera_update(float dt)
     g_cam.yaw = wrap_angle(g_cam.yaw);
 
     vec3_t want = cam_desired();
+    /* don't let the camera end up inside houses, trees or rocks: march from
+       the player towards the desired spot and stop before the first solid */
+    {
+        vec3_t from = v3_add(g_player.pos, v3(0, g_player.older ? 1.3f : 1.1f, 0));
+        vec3_t d = v3_sub(want, from);
+        float best = 1.0f;
+        for (int i = 1; i <= 8; i++) {
+            float f = i / 8.0f;
+            if (world_solid_at(v3_add(from, v3_scale(d, f)), 0.35f)) { best = (i - 1) / 8.0f; break; }
+        }
+        if (best < 1.0f) want = v3_add(from, v3_scale(d, fmaxf(best, 0.25f)));
+    }
     float gh = world_height(want.x, want.z) + 0.8f;
     if (want.y < gh) want.y = gh;
     float k = 1.0f - expf(-10.0f * dt);

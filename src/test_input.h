@@ -9,6 +9,7 @@ enum {
     TB_A = 0x8000, TB_B = 0x4000, TB_Z = 0x2000, TB_START = 0x1000,
     TB_DU = 0x0800, TB_DD = 0x0400, TB_DL = 0x0200, TB_DR = 0x0100,
     TB_L = 0x0020, TB_R = 0x0010, TB_CU = 0x0008, TB_CD = 0x0004, TB_CL = 0x0002, TB_CR = 0x0001,
+    TB_ADV = 0x0040,   /* pseudo-button: tap A every 0.4s while a dialogue or card is open */
 };
 
 typedef struct { float t0, t1; uint16_t buttons; int8_t sx, sy; void (*fn)(void); } tin_t;
@@ -18,24 +19,33 @@ static void tp_gate(void)    { g_player.pos = v3(0, 0, 35.6f); g_player.pos.y = 
 static void tp_yard(void)    { g_player.pos = v3(-19, 0, 11.0f); g_player.pos.y = world_height(-19, 11); g_player.yaw = 0; camera_snap(); }
 static void tp_wolves(void)  { g_player.pos = v3(-6, 0, -12.0f); g_player.pos.y = world_height(-6, -12); g_player.yaw = PI_F; camera_snap(); }
 static void tp_mesa(void)    { g_player.pos = v3(0, 0, 6.0f); g_player.pos.y = world_height(0, 6); g_player.yaw = PI_F; camera_snap(); }
+static void tp_square(void)  { g_player.pos = v3(-1.5f, 0, 13.0f); g_player.pos.y = world_height(-1.5f, 13); g_player.yaw = PI_F - 0.6f; camera_snap(); }
+static void tp_square2(void) { g_player.pos = v3(3.0f, 0, 3.0f); g_player.pos.y = world_height(3, 3); g_player.yaw = -0.9f; camera_snap(); }
+static void tp_boulder(void) { g_player.pos = v3(0, 0, -16.0f); g_player.pos.y = world_height(0, -16); g_player.yaw = PI_F; camera_snap(); }
 static void god_mode(void)   { g_player.max_hp = 99; g_player.hp = 99; }
 
 #if TEST_INPUT == 1
-/* chapter 1: talk to Zenith, meet Roxy, shoot the targets */
+/* chapter 1: Zenith, Roxy, targets, braziers, boulder */
+static void face(float x, float z) { g_player.yaw = yaw_towards(g_player.pos, v3(x, 0, z)); camera_snap(); }
+static void place(float x, float z) { g_player.pos = v3(x, world_height(x, z), z); }
+static void tp_br1(void) { place(-2.5f, 9.0f); face(-6, 9); }
+static void tp_br2(void) { place(2.5f, 9.0f); face(6, 9); }
+static void tp_br3(void) { place(3.0f, -1.0f); face(0, -1); }
 static const tin_t SCRIPT[] = {
     { 0.8f, 0.9f, 0, 0, 0, tp_zenith },
-    { 1.5f, 1.6f, TB_A }, { 3.0f, 3.1f, TB_A }, { 3.6f, 3.7f, TB_A }, { 4.8f, 4.9f, TB_A }, { 5.4f, 5.5f, TB_A },
-    { 6.8f, 6.9f, TB_A }, { 7.4f, 7.5f, TB_A }, { 8.8f, 8.9f, TB_A }, { 9.4f, 9.5f, TB_A },
-    { 10.5f, 10.6f, 0, 0, 0, tp_gate },
-    { 13.0f, 13.1f, TB_A }, { 13.6f, 13.7f, TB_A }, { 14.6f, 14.7f, TB_A }, { 15.2f, 15.3f, TB_A },
-    { 16.2f, 16.3f, TB_A }, { 16.8f, 16.9f, TB_A }, { 17.8f, 17.9f, TB_A }, { 18.4f, 18.5f, TB_A },
-    { 19.4f, 19.5f, TB_A }, { 20.0f, 20.1f, TB_A }, { 21.0f, 21.1f, TB_A }, { 21.6f, 21.7f, TB_A },
-    { 22.6f, 22.7f, TB_A }, { 23.2f, 23.3f, TB_A }, { 24.2f, 24.3f, TB_A }, { 24.8f, 24.9f, TB_A },
-    { 26.0f, 26.1f, 0, 0, 0, tp_yard },
-    { 27.0f, 33.0f, TB_Z },
-    { 27.3f, 27.4f, TB_CL }, { 28.4f, 28.5f, TB_CL }, { 29.5f, 30.6f, TB_CL },
-    { 31.5f, 31.6f, TB_Z }, { 31.8f, 33.0f, TB_Z }, { 32.0f, 32.1f, TB_CL },
-    { 33.5f, 37.0f, TB_Z }, { 33.8f, 33.9f, TB_CL }, { 35.0f, 35.1f, TB_CL },
+    { 1.5f, 1.6f, TB_A },
+    { 2.0f, 90.0f, TB_ADV },
+    { 9.0f, 9.1f, 0, 0, 0, tp_gate },
+    { 20.0f, 20.1f, 0, 0, 0, tp_yard },
+    { 21.0f, 22.0f, TB_Z }, { 21.3f, 21.4f, TB_CL },
+    { 22.5f, 23.5f, TB_Z }, { 22.8f, 22.9f, TB_CL },
+    { 24.0f, 25.0f, TB_Z }, { 24.3f, 24.4f, TB_CL },
+    { 25.5f, 26.5f, TB_Z }, { 25.8f, 25.9f, TB_CL },
+    { 27.0f, 28.0f, TB_Z }, { 27.3f, 27.4f, TB_CL },
+    { 34.0f, 34.1f, 0, 0, 0, tp_br1 }, { 34.5f, 34.6f, TB_CD },
+    { 36.0f, 36.1f, 0, 0, 0, tp_br2 }, { 36.5f, 36.6f, TB_CD },
+    { 38.0f, 38.1f, 0, 0, 0, tp_br3 }, { 38.5f, 38.6f, TB_CD },
+    { 46.0f, 46.1f, 0, 0, 0, tp_boulder }, { 46.5f, 46.6f, TB_CR }, { 48.0f, 49.0f, TB_CR },
 };
 #elif TEST_INPUT == 2
 /* forest: fight wolves with spells, lock-on and the staff */
@@ -76,9 +86,13 @@ static void test_input_apply(void)
     for (unsigned i = 0; i < sizeof(SCRIPT) / sizeof(SCRIPT[0]); i++) {
         const tin_t *e = &SCRIPT[i];
         if (t < e->t0 || t >= e->t1) continue;
+        if (e->buttons & TB_ADV) {
+            if ((dialog_active() || story_card_active()) && fmodf(t, 0.4f) < 0.1f) held |= TB_A;
+            continue;
+        }
         held |= e->buttons;
         if (e->sx || e->sy) { sx = e->sx; sy = e->sy; }
-        if (e->fn && !fired[i]) { fired[i] = true; e->fn(); }
+        if (e->fn && !fired[i]) { fired[i] = true; e->fn(); debugf("test t=%.1f event %u -> player %.1f %.1f %.1f\n", t, i, g_player.pos.x, g_player.pos.y, g_player.pos.z); }
     }
     g_frame.held.raw |= held;
     g_frame.pressed.raw |= held & ~prev;
