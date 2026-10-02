@@ -10,6 +10,7 @@ enum {
     TB_DU = 0x0800, TB_DD = 0x0400, TB_DL = 0x0200, TB_DR = 0x0100,
     TB_L = 0x0020, TB_R = 0x0010, TB_CU = 0x0008, TB_CD = 0x0004, TB_CL = 0x0002, TB_CR = 0x0001,
     TB_ADV = 0x0040,   /* pseudo-button: tap A every 0.4s while a dialogue or card is open */
+    TB_MASH = 0x0080,  /* pseudo-button: tap A every 0.15s */
 };
 
 typedef struct { float t0, t1; uint16_t buttons; int8_t sx, sy; void (*fn)(void); } tin_t;
@@ -46,6 +47,47 @@ static const tin_t SCRIPT[] = {
     { 36.0f, 36.1f, 0, 0, 0, tp_br2 }, { 36.5f, 36.6f, TB_CD },
     { 38.0f, 38.1f, 0, 0, 0, tp_br3 }, { 38.5f, 38.6f, TB_CD },
     { 46.0f, 46.1f, 0, 0, 0, tp_boulder }, { 46.5f, 46.6f, TB_CR }, { 48.0f, 49.0f, TB_CR },
+};
+#elif TEST_INPUT == 4
+/* chapters 2 and 3: bullies, Sylphie, healing, the gate, Cumulonimbus */
+static void place(float x, float z) { g_player.pos = v3(x, world_height(x, z), z); }
+static void face(float x, float z) { g_player.yaw = yaw_towards(g_player.pos, v3(x, 0, z)); camera_snap(); }
+static void tp_hill(void)    { god_mode(); place(0, -25); face(0, -35); }
+static void tp_sylphie(void) { place(0.5f, -33.6f); face(0.5f, -35.5f); }
+static void tp_home(void)    { place(-10.4f, 6.8f); face(-12.2f, 7.6f); }
+static void tp_exam(void)    { place(-1.6f, 35.6f); face(-1.6f, 37.5f); }
+static void tp_cross(void)   { place(0, 39.7f); face(0, 45); }
+static const tin_t SCRIPT[] = {
+    { 0.8f, 0.9f, 0, 0, 0, tp_hill },
+    { 1.0f, 200.0f, TB_ADV },
+    { 6.0f, 7.0f, TB_Z }, { 6.3f, 6.4f, TB_CL }, { 7.5f, 8.5f, TB_Z }, { 7.8f, 7.9f, TB_CL },
+    { 9.0f, 10.0f, TB_Z }, { 9.3f, 9.4f, TB_CL }, { 10.5f, 11.5f, TB_Z }, { 10.8f, 10.9f, TB_CL },
+    { 12.0f, 13.0f, TB_Z }, { 12.3f, 12.4f, TB_CL }, { 13.5f, 14.5f, TB_Z }, { 13.8f, 13.9f, TB_CL },
+    { 15.0f, 16.0f, TB_Z }, { 15.3f, 15.4f, TB_CL }, { 16.5f, 17.5f, TB_Z }, { 16.8f, 16.9f, TB_CL },
+    { 18.0f, 19.0f, TB_Z }, { 18.3f, 18.4f, TB_CL }, { 19.5f, 20.5f, TB_Z }, { 19.8f, 19.9f, TB_CL },
+    { 24.0f, 24.1f, 0, 0, 0, tp_sylphie }, { 24.5f, 24.6f, TB_A },
+    { 34.0f, 34.1f, 0, 0, 0, tp_home }, { 34.5f, 34.6f, TB_A },
+    { 44.0f, 44.1f, 0, 0, 0, tp_exam }, { 44.5f, 44.6f, TB_A },
+    { 50.0f, 50.1f, 0, 0, 0, tp_cross },
+    { 54.0f, 62.0f, TB_MASH },
+    { 66.0f, 66.1f, 0, 0, 0, tp_mesa },
+    { 72.0f, 74.45f, TB_R },
+};
+#elif TEST_INPUT == 5
+/* map transitions: cycle through every map and variant, twice */
+static const int TRANS_STEPS[] = { 12, 15, 1, 21, 18, 16, 12, 19, 1 };
+static void go_next(void)
+{
+    static int n;
+    story_debug_start(TRANS_STEPS[n++ % (sizeof(TRANS_STEPS) / sizeof(TRANS_STEPS[0]))]);
+}
+static const tin_t SCRIPT[] = {
+    { 3, 3.1f, 0, 0, 0, go_next }, { 6, 6.1f, 0, 0, 0, go_next }, { 9, 9.1f, 0, 0, 0, go_next },
+    { 12, 12.1f, 0, 0, 0, go_next }, { 15, 15.1f, 0, 0, 0, go_next }, { 18, 18.1f, 0, 0, 0, go_next },
+    { 21, 21.1f, 0, 0, 0, go_next }, { 24, 24.1f, 0, 0, 0, go_next }, { 27, 27.1f, 0, 0, 0, go_next },
+    { 30, 30.1f, 0, 0, 0, go_next }, { 33, 33.1f, 0, 0, 0, go_next }, { 36, 36.1f, 0, 0, 0, go_next },
+    { 39, 39.1f, 0, 0, 0, go_next }, { 42, 42.1f, 0, 0, 0, go_next }, { 45, 45.1f, 0, 0, 0, go_next },
+    { 48, 48.1f, 0, 0, 0, go_next }, { 51, 51.1f, 0, 0, 0, go_next }, { 54, 54.1f, 0, 0, 0, go_next },
 };
 #elif TEST_INPUT == 2
 /* forest: fight wolves with spells, lock-on and the staff */
@@ -88,6 +130,10 @@ static void test_input_apply(void)
         if (t < e->t0 || t >= e->t1) continue;
         if (e->buttons & TB_ADV) {
             if ((dialog_active() || story_card_active()) && fmodf(t, 0.4f) < 0.1f) held |= TB_A;
+            continue;
+        }
+        if (e->buttons & TB_MASH) {
+            if (fmodf(t, 0.15f) < 0.07f) held |= TB_A;
             continue;
         }
         held |= e->buttons;

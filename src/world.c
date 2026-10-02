@@ -484,7 +484,6 @@ static void build_terrain(void)
                     v->n[0] = 0; v->n[1] = 1; v->n[2] = 0;
                     v->c = tcolors[z0 + z][x0 + x] | 0xFF;
                 }
-            dl_free(chunk_lists[cz * CHUNKS + cx]);
             dl_begin();
             gfx_draw_indexed(verts, CV * CV, idx, ni, true, false);
             chunk_lists[cz * CHUNKS + cx] = dl_end();
@@ -496,7 +495,6 @@ static void build_sky(void)
 {
     static const float elev[] = { -0.5f, -0.02f, 0.18f, 0.55f, 1.0f, 1.5708f };
     const int SEG = 10, NR = sizeof(elev) / sizeof(elev[0]);
-    dl_free(sky_list);
     dl_begin();
     glBegin(GL_TRIANGLES);
     for (int r = 0; r < NR - 1; r++) {
@@ -738,6 +736,24 @@ static void set_map_info(map_id_t id)
 void bake_props(void);
 static uint32_t prop_tint(const prop_t *p, int idx);
 
+static dlist_t bake_list[CHUNKS * CHUNKS][NPASS];   /* NULL = nothing to draw */
+static dlist_t boulder_list;
+
+/* Release all of the current map's display lists; the new ones are recorded
+   at the start of the next frame. */
+static void free_world_lists(void)
+{
+    for (int c = 0; c < CHUNKS * CHUNKS; c++) {
+        dl_free(chunk_lists[c]);
+        chunk_lists[c] = NULL;
+        for (int k = 0; k < NPASS; k++) { dl_free(bake_list[c][k]); bake_list[c][k] = NULL; }
+    }
+    dl_free(sky_list);
+    sky_list = NULL;
+    dl_free(boulder_list);
+    boulder_list = NULL;
+}
+
 void world_init(void)
 {
 }
@@ -758,6 +774,7 @@ void world_load(map_id_t id)
     case MAP_PLATEAU: paths = PLATEAU_PATHS; npaths = sizeof(PLATEAU_PATHS) / sizeof(seg_t); ground_tex = TEX_DIRT;  break;
     default:          paths = DEMON_PATHS;   npaths = sizeof(DEMON_PATHS) / sizeof(seg_t);   ground_tex = TEX_DIRT;  break;
     }
+    free_world_lists();
     compute_terrain();
 
     nprops = 0;
@@ -776,7 +793,7 @@ void world_load(map_id_t id)
 
 static void record_world_lists(void)
 {
-    rspq_wait();   /* the RSP may still be drawing the previous lists */
+    rspq_wait();
     build_terrain();
     build_sky();
     bake_props();
@@ -958,6 +975,7 @@ void world_update(float dt)
     if (g_world.storm && !baked_storm) {
         /* the sun goes behind the clouds: re-light the terrain and props */
         baked_storm = true;
+        free_world_lists();
         compute_terrain();
         lists_dirty = true;
     }
@@ -1092,8 +1110,6 @@ static uint32_t prop_tint(const prop_t *p, int idx)
 /* Static props are baked per terrain chunk and per texture into display
    lists, with the sun lighting pre-computed into vertex colors. Drawing the
    whole village is then a handful of list calls with no per-prop CPU work. */
-static dlist_t bake_list[CHUNKS * CHUNKS][NPASS];   /* NULL = nothing to draw */
-static dlist_t boulder_list;
 static int boulder_idx = -1;
 
 static int chunk_of(float x, float z)
@@ -1122,11 +1138,6 @@ static int emit_chunk_pass(int c)
 
 void bake_props(void)
 {
-    rspq_wait();
-    for (int c = 0; c < CHUNKS * CHUNKS; c++)
-        for (int k = 0; k < NPASS; k++)
-            if (bake_list[c][k]) { dl_free(bake_list[c][k]); bake_list[c][k] = NULL; }
-    if (boulder_list) { dl_free(boulder_list); boulder_list = NULL; }
     boulder_idx = -1;
 
     uint32_t sun = g_world.storm ? color_mul(g_world.sun_color, 0.35f) : g_world.sun_color;

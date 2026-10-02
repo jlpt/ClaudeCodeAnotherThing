@@ -584,10 +584,58 @@ void gfx_init(void)
     g_cam.pitch = 0.32f;
 }
 
+/* libdragon's GL pipeline records each vertex-loader command into a slot of
+   fixed size but fills only the instructions it needs; the RSP copies the
+   whole slot into IMEM and runs it. rspq clears its own ring buffers, but not
+   the memory of a block, so once the heap hands out memory of a freed block
+   the leftover words run as RSP code (this crashed every map change).
+   Block memory comes from malloc_uncached, which the Makefile wraps
+   (--wrap=malloc_uncached) so that it returns zeroed memory: unused slots
+   stay NOPs. */
+void *__real_malloc_uncached(size_t size);
+void *__wrap_malloc_uncached(size_t size)
+{
+    void *p = __real_malloc_uncached(size);
+    if (p) {
+        void *c = CachedAddr(p);
+        memset(c, 0, size);
+        data_cache_hit_writeback_invalidate(c, size);
+    }
+    return p;
+}
+
+/* Freed lists are parked until the start of a later frame and released there
+   in one go, behind a single rspq_wait(). */
+#ifndef DL_FREE_DELAY
+#define DL_FREE_DELAY 2
+#endif
+#define DL_GRAVE 256
+static dlist_t grave[DL_GRAVE];
+static uint32_t grave_frame[DL_GRAVE];
+static int ngrave;
+
+static void dl_collect(bool all)
+{
+    int keep = 0;
+    bool waited = false;
+    for (int i = 0; i < ngrave; i++) {
+        if (all || g_frame.frame - grave_frame[i] >= DL_FREE_DELAY) {
+            if (!waited) { rspq_wait(); waited = true; }
+            rspq_block_free(grave[i]);
+        } else {
+            grave[keep] = grave[i];
+            grave_frame[keep++] = grave_frame[i];
+        }
+    }
+    ngrave = keep;
+}
+
 void dl_free(dlist_t l)
 {
-    /* the RSP may still be executing the block: free it once it's done */
-    if (l) rdpq_call_deferred((void (*)(void *))rspq_block_free, l);
+    if (!l) return;
+    if (ngrave == DL_GRAVE) dl_collect(true);
+    grave[ngrave] = l;
+    grave_frame[ngrave++] = g_frame.frame;
 }
 
 void gfx_bind(tex_id_t t)
@@ -657,6 +705,7 @@ static void mat_mul(float *out, const float *a, const float *b)
 
 void gfx_begin_frame_3d(uint32_t clear_color)
 {
+    if (ngrave) dl_collect(false);
     surface_t *disp = display_get();
     rdpq_attach(disp, display_get_zbuf());
     gl_context_begin();

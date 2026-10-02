@@ -14,6 +14,8 @@ ROM = mushoku64.z64
 # Extra compiler flags for debug/test builds, e.g.
 #   make EXTRA_CFLAGS=-DTEST_STEP=1     (boot straight into a story step)
 N64_CFLAGS += $(EXTRA_CFLAGS)
+# zero block memory (see __wrap_malloc_uncached in src/gfx.c)
+LDFLAGS += --wrap=malloc_uncached
 
 src = $(wildcard src/*.c)
 

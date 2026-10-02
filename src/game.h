@@ -145,7 +145,7 @@ typedef rspq_block_t *dlist_t;
 static inline void dl_begin(void) { rspq_block_begin(); }
 static inline dlist_t dl_end(void) { return rspq_block_end(); }
 static inline void dl_call(dlist_t l) { if (l) rspq_block_run(l); }
-void dl_free(dlist_t l);
+void dl_free(dlist_t l);    /* released a few frames later */
 
 /* interleaved vertex used for indexed drawing */
 typedef struct { float p[3]; float t[2]; float n[3]; uint32_t c; } gfx_vtx_t;
