@@ -140,12 +140,6 @@ static void render_scene(bool actors)
     gfx_bind(TEX_NONE);
     glEnable(GL_LIGHTING);
     glEnable(GL_FOG);
-#ifdef EXP_NOLIGHT
-    glDisable(GL_LIGHTING);
-#endif
-#ifdef EXP_NOFOG
-    glDisable(GL_FOG);
-#endif
     if (actors) {
         /* characters are rigid segments at scale 1: no need to renormalize normals */
         glDisable(GL_NORMALIZE);
@@ -369,9 +363,7 @@ static void gl_setup(void)
     glShadeModel(GL_SMOOTH);
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_CULL_FACE);
-#ifndef EXP_NOAA
     glEnable(GL_MULTISAMPLE_ARB);
-#endif
     GLfloat spec[4] = { 0, 0, 0, 1 };
     glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, spec);
 }
@@ -420,6 +412,7 @@ int main(void)
 {
     debug_init_isviewer();
     debug_init_usblog();
+    debugf("Mushoku Tensei 64: %d KB RAM\n", get_memory_size() / 1024);
     dfs_init(DFS_DEFAULT_LOCATION);
     display_init(RESOLUTION_320x240, DEPTH_16_BPP, 3, GAMMA_NONE, FILTERS_RESAMPLE_ANTIALIAS_DEDITHER);
     rdpq_init();

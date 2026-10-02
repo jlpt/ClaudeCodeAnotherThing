@@ -137,9 +137,6 @@ static uint16_t autopilot(float t)
 static void collapse(void) { g_player.hp = 0; }
 static const tin_t SCRIPT[] = {
     { 2.0f, 2.1f, TB_A },                       /* New Game */
-#ifdef QUICK_QUIT
-    { 3.0f, 30.0f, TB_ADV }, { 14.0f, 14.1f, TB_START }, { 15.0f, 15.1f, TB_DD }, { 16.0f, 16.1f, TB_A },
-#endif
     { 3.0f, 34.0f, TB_ADV },                    /* intro narration */
     { 36.0f, 36.1f, TB_START }, { 39.0f, 39.1f, TB_START },     /* pause, resume */
     { 41.0f, 41.1f, 0, 0, 0, collapse }, { 47.0f, 47.1f, TB_A }, /* game over: Try Again */

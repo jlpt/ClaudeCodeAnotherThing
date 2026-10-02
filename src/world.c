@@ -799,6 +799,11 @@ static void record_world_lists(void)
     bake_props();
     lists_ready = true;
     lists_dirty = false;
+#ifdef TEST_INPUT
+    heap_stats_t hs;
+    sys_get_heap_stats(&hs);
+    debugf("map %d recorded: heap %d / %d KB\n", g_world.id, hs.used / 1024, hs.total / 1024);
+#endif
 }
 
 /* ------------------------------------------------------------------ */
@@ -1193,11 +1198,7 @@ void world_render(void)
 {
     uint32_t fog = g_world.storm ? storm_mix(g_world.fog_color, 1.0f) : g_world.fog_color;
     apply_fog(fog);
-#ifdef EXP_NOFOG
-    glDisable(GL_FOG);
-#else
     glEnable(GL_FOG);
-#endif
 
     /* sun light for lit objects (set while the modelview is the view matrix) */
     float sd = g_world.storm ? 0.45f : 1.0f;

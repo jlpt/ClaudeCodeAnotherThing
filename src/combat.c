@@ -72,9 +72,6 @@ static const uint32_t PRJ_COLORS[] = { 0x60B8FFFF, 0xFF8A30FF, 0xA89878FF, 0x7A5
 
 void projectile_spawn(prj_type_t type, vec3_t pos, vec3_t vel, bool from_player, float power, int homing_target)
 {
-#ifdef DEBUG_COMBAT
-    debugf("spawn prj type %d at %.1f %.1f %.1f vel %.1f %.1f %.1f target %d\n", type, pos.x, pos.y, pos.z, vel.x, vel.y, vel.z, homing_target);
-#endif
     for (int i = 0; i < MAX_PROJECTILES; i++) {
         projectile_t *p = &prj[i];
         if (p->active) continue;
@@ -158,9 +155,6 @@ static void update_projectiles(float dt)
                 vec3_t c = v3_add(e->pos, v3(0, e->radius * 0.8f, 0));
                 float r = e->radius + p->radius;
                 if (e->type == EN_TARGET) c.y = e->pos.y + 0.9f;
-#ifdef DEBUG_COMBAT
-                { float dd = v3_len(v3_sub(c, p->pos)); if (dd < 2.5f) debugf("prj %d near enemy %d type %d: d=%.2f r=%.2f prj(%.1f %.1f %.1f) c(%.1f %.1f %.1f) hp %.1f\n", i, k, e->type, dd, r, p->pos.x, p->pos.y, p->pos.z, c.x, c.y, c.z, e->hp); }
-#endif
                 if (v3_dot(v3_sub(c, p->pos), v3_sub(c, p->pos)) < r * r) {
                     enemy_hit(k, p->damage, p->pos, prj_spell(p));
                     hit = true;
