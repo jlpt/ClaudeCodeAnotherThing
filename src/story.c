@@ -558,6 +558,7 @@ static void begin_chapter_1(void)
     set_step(ST_TALK_ZENITH);
     enter_map(MAP_VILLAGE, -9.0f, 4.0f, -PI_F / 2);
     chapter_card();
+    autosave(ST_TALK_ZENITH);   /* so that Continue is offered from the start */
 }
 static void after_intro(void) { game_fade_to(begin_chapter_1); }
 

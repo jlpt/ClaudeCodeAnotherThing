@@ -321,7 +321,7 @@ static void gameover_render(void)
 static const char *const CREDITS[] = {
     "$03MUSHOKU TENSEI 64", "An unofficial Nintendo 64 fan game", "",
     "Based on \"Mushoku Tensei: Jobless Reincarnation\"", "by Rifujin na Magonote", "",
-    "$03Game Design, Code, Models & Music", "Claude (Anthropic)", "",
+    "$03Design, Code, Art & Music", "Claude (Anthropic)", "",
     "$03Built With", "libdragon - the open source N64 SDK", "DejaVu fonts", "",
     "$03Cast", "Rudeus Greyrat", "Roxy Migurdia", "Sylphiette", "Paul & Zenith Greyrat", "Lilia",
     "Ruijerd Superdia", "", "", "Thank you for playing!", "", "", "$03THE END",

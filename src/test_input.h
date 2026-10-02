@@ -89,6 +89,64 @@ static const tin_t SCRIPT[] = {
     { 39, 39.1f, 0, 0, 0, go_next }, { 42, 42.1f, 0, 0, 0, go_next }, { 45, 45.1f, 0, 0, 0, go_next },
     { 48, 48.1f, 0, 0, 0, go_next }, { 51, 51.1f, 0, 0, 0, go_next }, { 54, 54.1f, 0, 0, 0, go_next },
 };
+#elif TEST_INPUT == 6
+/* autopilot from the Cumulonimbus exam to the credits: talks to whoever the
+   story needs, plays the minigames and defeats every enemy it meets */
+#define TEST_AUTOPILOT
+static void place(float x, float z) { g_player.pos = v3(x, world_height(x, z), z); }
+static void face(float x, float z) { g_player.yaw = yaw_towards(g_player.pos, v3(x, 0, z)); camera_snap(); }
+static void kill_all(void)
+{
+    for (int i = 0; i < MAX_ENEMIES; i++)
+        if (g_enemies[i].active && g_enemies[i].hp > 0) enemy_hit(i, 999, g_enemies[i].pos, -1);
+}
+static const tin_t SCRIPT[] = { { 0.5f, 0.6f, 0, 0, 0, god_mode } };
+static uint16_t autopilot(float t)
+{
+    static int ap_step = -1;
+    static float ap_t, hold0 = -1, last_kill;
+    static bool moved;
+    int step = g_save.step;
+    if (step != ap_step) { ap_step = step; ap_t = t; moved = false; hold0 = -1; }
+    if (dialog_active() || story_card_active()) return fmodf(t, 0.4f) < 0.1f ? TB_A : 0;
+    if (game_fading() || t - ap_t < 1.0f) return 0;
+    switch (step) {
+    case ST_CUMULONIMBUS:
+        if (!g_player.locked) { if (!moved) { place(0, 6); face(0, 0); moved = true; } return 0; }
+        if (hold0 < 0) hold0 = t;
+        return fmodf(t - hold0, 4.5f) < 2.45f ? TB_R : 0;
+    case ST_TALK_PAUL:
+        if (!moved) { place(-34.6f, 3); face(-36, 3); moved = true; }
+        return fmodf(t, 1.0f) < 0.1f ? TB_A : 0;
+    case ST_FOREST: case ST_BOSS_BOAR: case ST_CRYSTALS: case ST_CORE:
+        if (g_world.id == MAP_VILLAGE && step == ST_FOREST) { place(-44.3f, 2); return 0; }
+        if (t - last_kill > 1.5f) { last_kill = t; kill_all(); }
+        return 0;
+    case ST_CALAMITY:
+        if (!moved) { place(3, 16); face(3, 13); moved = true; }
+        return 0;
+    case ST_DEMON_WAKE:
+        if (!g_player.locked && !moved && t - ap_t > 6.0f) { place(1.5f, -2.0f); face(1.5f, -5); moved = true; }
+        return 0;
+    default:
+        return 0;
+    }
+}
+#elif TEST_INPUT == 7
+/* front end: New Game, intro, pause, game over + Try Again, quit, Continue */
+static void collapse(void) { g_player.hp = 0; }
+static const tin_t SCRIPT[] = {
+    { 2.0f, 2.1f, TB_A },                       /* New Game */
+#ifdef QUICK_QUIT
+    { 3.0f, 30.0f, TB_ADV }, { 14.0f, 14.1f, TB_START }, { 15.0f, 15.1f, TB_DD }, { 16.0f, 16.1f, TB_A },
+#endif
+    { 3.0f, 34.0f, TB_ADV },                    /* intro narration */
+    { 36.0f, 36.1f, TB_START }, { 39.0f, 39.1f, TB_START },     /* pause, resume */
+    { 41.0f, 41.1f, 0, 0, 0, collapse }, { 47.0f, 47.1f, TB_A }, /* game over: Try Again */
+    { 53.0f, 53.1f, TB_START }, { 54.0f, 54.1f, TB_DD }, { 55.0f, 55.1f, TB_A },   /* quit to title */
+    { 60.0f, 60.1f, TB_A },                     /* Continue */
+    { 61.0f, 75.0f, TB_ADV },
+};
 #elif TEST_INPUT == 2
 /* forest: fight wolves with spells, lock-on and the staff */
 static const tin_t SCRIPT[] = {
@@ -166,6 +224,9 @@ static void test_input_apply(void)
         if (e->sx || e->sy) { sx = e->sx; sy = e->sy; }
         if (e->fn && !fired[i]) { fired[i] = true; e->fn(); debugf("test t=%.1f event %u -> player %.1f %.1f %.1f\n", t, i, g_player.pos.x, g_player.pos.y, g_player.pos.z); }
     }
+#ifdef TEST_AUTOPILOT
+    held |= autopilot(t);
+#endif
     g_frame.held.raw |= held;
     g_frame.pressed.raw |= held & ~prev;
     g_frame.released.raw |= prev & ~held;
