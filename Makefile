@@ -30,8 +30,9 @@ assets_conv += filesystem/body.font64 filesystem/outline.font64 filesystem/title
 all: $(ROM)
 
 # World textures: 32x32 grayscale detail maps, tinted by vertex colour.
-# Mipmapped: trilinear filtering avoids shimmering, and with fog enabled the
-# RDP runs in 2-cycle mode and samples the second mip tile as well.
+# Mipmapped: with fog enabled the RDP runs in 2-cycle mode and also samples
+# the next tile; without mip levels there it held garbage and smeared the
+# texture along one axis.
 filesystem/tex_%.sprite: assets/tex_%.png
 	@mkdir -p $(dir $@)
 	@echo "    [SPRITE] $@"
