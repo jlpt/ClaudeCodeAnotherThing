@@ -11,6 +11,10 @@ include $(N64_INST)/include/n64.mk
 
 ROM = mushoku64.z64
 
+# Extra compiler flags for debug/test builds, e.g.
+#   make EXTRA_CFLAGS=-DTEST_STEP=1     (boot straight into a story step)
+N64_CFLAGS += $(EXTRA_CFLAGS)
+
 src = $(wildcard src/*.c)
 
 tex_png = $(wildcard assets/tex_*.png)

@@ -16,101 +16,104 @@ world_t g_world;
 
 static float heights[VERTS][VERTS];
 static uint32_t tcolors[VERTS][VERTS];
-static GLuint chunk_lists, sky_list;
+static dlist_t chunk_lists[CHUNKS * CHUNKS], sky_list;
 static bool lists_ready;
+static bool baked_storm;
 static bool calamity;
 static tex_id_t ground_tex;
 static uint32_t map_seed;
 
 static prop_t props[MAX_PROPS];
 static int nprops;
-static int visible[MAX_PROPS];
-static int nvisible;
 
 /* ------------------------------------------------------------------ */
-/* Prop meshes                                                         */
+/* Prop geometry                                                       */
 /* ------------------------------------------------------------------ */
 
 enum { COL_NONE, COL_CIRCLE, COL_BOX, COL_GATE };
 
-typedef struct { tex_id_t tex; GLuint list; bool tinted; } prop_part_t;
 typedef struct {
-    prop_part_t parts[5];
-    int nparts;
     float cull_r;
     uint8_t col;
     float cr, chx, chz;   /* collider radius / box half extents */
     float top;            /* height of the solid part (projectiles fly over lower things) */
-} prop_mesh_t;
+} prop_info_t;
 
-static prop_mesh_t meshes[PROP_COUNT];
+static const prop_info_t PROP_INFO[PROP_COUNT] = {
+    [PROP_HOUSE]     = { 4.9f, COL_BOX, 0, 3.15f, 2.65f, 5.3f },
+    [PROP_HOUSE_BIG] = { 6.7f, COL_BOX, 0, 4.65f, 3.65f, 7.4f },
+    [PROP_TREE]      = { 3.0f, COL_CIRCLE, 0.45f, 0, 0, 6.0f },
+    [PROP_PINE]      = { 3.0f, COL_CIRCLE, 0.4f, 0, 0, 6.0f },
+    [PROP_BIGTREE]   = { 7.0f, COL_CIRCLE, 1.2f, 0, 0, 12.0f },
+    [PROP_ROCK]      = { 1.5f, COL_CIRCLE, 0.85f, 0, 0, 0.9f },
+    [PROP_FENCE]     = { 4.2f, COL_BOX, 0, 4.0f, 0.2f, 1.3f },
+    [PROP_WELL]      = { 2.0f, COL_CIRCLE, 1.1f, 0, 0, 1.0f },
+    [PROP_BRAZIER]   = { 1.0f, COL_CIRCLE, 0.45f, 0, 0, 1.3f },
+    [PROP_BOULDER]   = { 3.0f, COL_CIRCLE, 2.45f, 0, 0, 3.4f },
+    [PROP_GATE]      = { 4.5f, COL_GATE, 0.35f, 0, 0, 4.2f },
+    [PROP_CART]      = { 3.0f, COL_BOX, 0, 1.1f, 1.5f, 1.3f },
+    [PROP_CRATE]     = { 1.0f, COL_BOX, 0, 0.55f, 0.55f, 0.9f },
+    [PROP_SIGN]      = { 1.0f, COL_CIRCLE, 0.2f, 0, 0, 1.6f },
+    [PROP_DEADTREE]  = { 3.0f, COL_CIRCLE, 0.4f, 0, 0, 5.0f },
+    [PROP_CRAG]      = { 3.5f, COL_CIRCLE, 1.4f, 0, 0, 5.0f },
+    [PROP_HAY]       = { 1.2f, COL_CIRCLE, 0.75f, 0, 0, 1.0f },
+    [PROP_BENCH]     = { 1.2f, COL_BOX, 0, 1.0f, 0.3f, 0.6f },
+};
+
+/* The texture pass being emitted. Each prop emits only the parts that use
+   this texture, so a whole chunk's props can be batched per texture. */
+static tex_id_t cur_pass;
+
+static bool part(tex_id_t tex, uint32_t color)
+{
+    if (tex != cur_pass) return false;
+    mb_set_color(color);
+    return true;
+}
 
 static const tex_id_t PASS_ORDER[] = { TEX_PLASTER, TEX_ROOF, TEX_WOOD, TEX_STONE, TEX_BARK, TEX_LEAVES, TEX_GRASS, TEX_NONE };
+#define NPASS ((int)(sizeof(PASS_ORDER) / sizeof(PASS_ORDER[0])))
 
-static GLuint begin_part(prop_type_t t, tex_id_t tex, bool tinted, uint32_t color)
-{
-    prop_mesh_t *m = &meshes[t];
-    GLuint l = glGenLists(1);
-    m->parts[m->nparts++] = (prop_part_t){ tex, l, tinted };
-    glNewList(l, GL_COMPILE);
-    mb_begin(tinted ? 0 : color);
-    return l;
-}
-
-static void end_part(void)
-{
-    mb_end();
-    glEndList();
-}
-
-static void build_house(prop_type_t t, float w, float d, float hw, float hr, bool big)
+static void emit_house(float w, float d, float hw, float hr, bool big, uint32_t roof)
 {
     const float x = w * 0.5f, z = d * 0.5f;
-
-    begin_part(t, TEX_PLASTER, false, 0xEEE6D2FF);
-    mb_box(v3(-x, -1.0f, -z), v3(x, hw, z), 2.0f);
-    mb_tri(v3(-x, hw, z), v3(x, hw, z), v3(0, hr, z), v3(0, 0, 1), 2.0f);
-    mb_tri(v3(-x, hw, -z), v3(x, hw, -z), v3(0, hr, -z), v3(0, 0, -1), 2.0f);
-    end_part();
-
-    begin_part(t, TEX_ROOF, true, 0);
-    {
+    if (part(TEX_PLASTER, 0xEEE6D2FF)) {
+        mb_box(v3(-x, -1.0f, -z), v3(x, hw, z), 2.0f);
+        mb_tri(v3(-x, hw, z), v3(x, hw, z), v3(0, hr, z), v3(0, 0, 1), 2.0f);
+        mb_tri(v3(-x, hw, -z), v3(x, hw, -z), v3(0, hr, -z), v3(0, 0, -1), 2.0f);
+    }
+    if (part(TEX_ROOF, roof)) {
         float ox = x + 0.6f, ey = hw - 0.25f, ry = hr + 0.25f;
         float ang = atan2f(ry - ey, ox);
         float half = sqrtf(ox * ox + (ry - ey) * (ry - ey)) * 0.5f + 0.1f;
         mb_box_rot(v3(-ox * 0.5f, (ey + ry) * 0.5f, 0), v3(half, 0.14f, z + 0.5f), 0, 0, ang, 1.5f);
         mb_box_rot(v3(ox * 0.5f, (ey + ry) * 0.5f, 0), v3(half, 0.14f, z + 0.5f), 0, 0, -ang, 1.5f);
     }
-    end_part();
-
-    begin_part(t, TEX_WOOD, false, 0x5E4029FF);
-    for (int sx = -1; sx <= 1; sx += 2)
-        for (int sz = -1; sz <= 1; sz += 2)
-            mb_box(v3(sx * x - 0.18f, -0.5f, sz * z - 0.18f), v3(sx * x + 0.18f, hw, sz * z + 0.18f), 1.0f);
-    mb_box(v3(-x - 0.05f, hw * 0.48f, z - 0.05f), v3(x + 0.05f, hw * 0.48f + 0.22f, z + 0.12f), 1.0f);
-    mb_box(v3(-x - 0.05f, hw * 0.48f, -z - 0.12f), v3(x + 0.05f, hw * 0.48f + 0.22f, -z + 0.05f), 1.0f);
-    mb_set_color(0x7A5234FF);
-    mb_box(v3(-0.65f, -0.2f, z), v3(0.65f, 2.1f, z + 0.12f), 1.0f);   /* door */
-    if (big) {
-        /* porch with roof */
-        mb_set_color(0x8A6A48FF);
-        mb_box(v3(-2.2f, -0.6f, z), v3(2.2f, 0.15f, z + 2.0f), 1.0f);
-        mb_box(v3(-2.0f, 0.1f, z + 1.7f), v3(-1.8f, 2.6f, z + 1.9f), 1.0f);
-        mb_box(v3(1.8f, 0.1f, z + 1.7f), v3(2.0f, 2.6f, z + 1.9f), 1.0f);
-        mb_box_rot(v3(0, 2.75f, z + 1.0f), v3(2.4f, 0.1f, 1.2f), -0.25f, 0, 0, 1.0f);
+    if (part(TEX_WOOD, 0x5E4029FF)) {
+        for (int sx = -1; sx <= 1; sx += 2)
+            for (int sz = -1; sz <= 1; sz += 2)
+                mb_box(v3(sx * x - 0.18f, -0.5f, sz * z - 0.18f), v3(sx * x + 0.18f, hw, sz * z + 0.18f), 1.0f);
+        mb_box(v3(-x - 0.05f, hw * 0.48f, z - 0.05f), v3(x + 0.05f, hw * 0.48f + 0.22f, z + 0.12f), 1.0f);
+        mb_box(v3(-x - 0.05f, hw * 0.48f, -z - 0.12f), v3(x + 0.05f, hw * 0.48f + 0.22f, -z + 0.05f), 1.0f);
+        mb_set_color(0x7A5234FF);
+        mb_box(v3(-0.65f, -0.2f, z), v3(0.65f, 2.1f, z + 0.12f), 1.0f);
+        if (big) {
+            mb_set_color(0x8A6A48FF);
+            mb_box(v3(-2.2f, -0.6f, z), v3(2.2f, 0.15f, z + 2.0f), 1.0f);
+            mb_box(v3(-2.0f, 0.1f, z + 1.7f), v3(-1.8f, 2.6f, z + 1.9f), 1.0f);
+            mb_box(v3(1.8f, 0.1f, z + 1.7f), v3(2.0f, 2.6f, z + 1.9f), 1.0f);
+            mb_box_rot(v3(0, 2.75f, z + 1.0f), v3(2.4f, 0.1f, 1.2f), -0.25f, 0, 0, 1.0f);
+        }
     }
-    end_part();
-
-    begin_part(t, TEX_NONE, false, 0x2A3448FF);
-    {
+    if (part(TEX_NONE, 0x2A3448FF)) {
         float wy0 = hw * 0.2f + 0.4f, wy1 = wy0 + 0.9f;
         for (int row = 0; row < (big ? 2 : 1); row++) {
             float y0 = wy0 + row * hw * 0.48f, y1 = wy1 + row * hw * 0.48f;
-            for (int s = -1; s <= 1; s += 2) {
-                float cx = s * x * 0.55f;
+            for (int sd = -1; sd <= 1; sd += 2) {
+                float cx = sd * x * 0.55f;
                 mb_quad(v3(cx - 0.45f, y0, z + 0.02f), v3(cx + 0.45f, y0, z + 0.02f),
                         v3(cx + 0.45f, y1, z + 0.02f), v3(cx - 0.45f, y1, z + 0.02f), v3(0, 0, 1), 1.0f);
-                float cz = s * z * 0.4f;
+                float cz = sd * z * 0.4f;
                 mb_quad(v3(x + 0.02f, y0, cz - 0.45f), v3(x + 0.02f, y0, cz + 0.45f),
                         v3(x + 0.02f, y1, cz + 0.45f), v3(x + 0.02f, y1, cz - 0.45f), v3(1, 0, 0), 1.0f);
                 mb_quad(v3(-x - 0.02f, y0, cz - 0.45f), v3(-x - 0.02f, y0, cz + 0.45f),
@@ -118,168 +121,136 @@ static void build_house(prop_type_t t, float w, float d, float hw, float hr, boo
             }
         }
     }
-    end_part();
-
-    begin_part(t, TEX_STONE, false, 0x8A847AFF);
-    mb_box(v3(x * 0.45f, hw, -z * 0.5f), v3(x * 0.45f + 0.8f, hr + 0.6f, -z * 0.5f + 0.8f), 1.0f);
-    end_part();
-
-    meshes[t].cull_r = sqrtf(x * x + z * z) + 1.0f;
-    meshes[t].col = COL_BOX;
-    meshes[t].chx = x + 0.15f;
-    meshes[t].chz = z + 0.15f;
-    meshes[t].top = hr;
+    if (part(TEX_STONE, 0x8A847AFF))
+        mb_box(v3(x * 0.45f, hw, -z * 0.5f), v3(x * 0.45f + 0.8f, hr + 0.6f, -z * 0.5f + 0.8f), 1.0f);
 }
 
-static void build_meshes(void)
+static void emit_prop(const prop_t *p, uint32_t tint)
 {
-    memset(meshes, 0, sizeof(meshes));
-    build_house(PROP_HOUSE, 6.0f, 5.0f, 3.2f, 5.3f, false);
-    build_house(PROP_HOUSE_BIG, 9.0f, 7.0f, 4.4f, 7.4f, true);
-
-    /* deciduous tree */
-    begin_part(PROP_TREE, TEX_BARK, false, 0x6A4A30FF);
-    mb_cyl(v3(0, -0.3f, 0), 0.32f, 3.4f, 5, 1.5f, false);
-    end_part();
-    begin_part(PROP_TREE, TEX_LEAVES, true, 0);
-    mb_blob(v3(0, 3.8f, 0), v3(1.9f, 1.6f, 1.9f), 6, 4, 1.5f);
-    mb_blob(v3(0.4f, 4.9f, 0.2f), v3(1.2f, 1.1f, 1.2f), 6, 3, 1.5f);
-    end_part();
-    meshes[PROP_TREE].cull_r = 3.0f; meshes[PROP_TREE].col = COL_CIRCLE; meshes[PROP_TREE].cr = 0.45f; meshes[PROP_TREE].top = 6.0f;
-
-    /* pine */
-    begin_part(PROP_PINE, TEX_BARK, false, 0x5A4030FF);
-    mb_cyl(v3(0, -0.3f, 0), 0.25f, 1.8f, 5, 1.5f, false);
-    end_part();
-    begin_part(PROP_PINE, TEX_LEAVES, true, 0);
-    mb_cone(v3(0, 1.2f, 0), 1.9f, 2.5f, 6, 1.5f);
-    mb_cone(v3(0, 2.6f, 0), 1.45f, 2.2f, 6, 1.5f);
-    mb_cone(v3(0, 3.9f, 0), 1.0f, 2.1f, 6, 1.5f);
-    end_part();
-    meshes[PROP_PINE].cull_r = 3.0f; meshes[PROP_PINE].col = COL_CIRCLE; meshes[PROP_PINE].cr = 0.4f; meshes[PROP_PINE].top = 6.0f;
-
-    /* the great tree on the hill */
-    begin_part(PROP_BIGTREE, TEX_BARK, false, 0x6A4A30FF);
-    mb_cyl(v3(0, -0.5f, 0), 0.95f, 6.5f, 7, 2.0f, false);
-    mb_box_rot(v3(1.4f, 5.6f, 0), v3(1.6f, 0.25f, 0.25f), 0, 0, 0.6f, 1.0f);
-    mb_box_rot(v3(-1.3f, 6.0f, 0.4f), v3(1.5f, 0.22f, 0.22f), 0, 0.3f, -0.6f, 1.0f);
-    end_part();
-    begin_part(PROP_BIGTREE, TEX_LEAVES, true, 0);
-    mb_blob(v3(0, 8.2f, 0), v3(5.0f, 3.2f, 5.0f), 8, 4, 2.0f);
-    mb_blob(v3(2.6f, 9.6f, 1.0f), v3(2.8f, 2.2f, 2.8f), 6, 3, 2.0f);
-    mb_blob(v3(-2.4f, 9.4f, -1.4f), v3(2.8f, 2.2f, 2.8f), 6, 3, 2.0f);
-    end_part();
-    meshes[PROP_BIGTREE].cull_r = 7.0f; meshes[PROP_BIGTREE].col = COL_CIRCLE; meshes[PROP_BIGTREE].cr = 1.2f; meshes[PROP_BIGTREE].top = 12.0f;
-
-    /* rock */
-    begin_part(PROP_ROCK, TEX_STONE, false, 0x8A8680FF);
-    mb_blob(v3(0, 0.15f, 0), v3(1.0f, 0.75f, 0.85f), 5, 3, 1.0f);
-    end_part();
-    meshes[PROP_ROCK].cull_r = 1.5f; meshes[PROP_ROCK].col = COL_CIRCLE; meshes[PROP_ROCK].cr = 0.85f; meshes[PROP_ROCK].top = 0.9f;
-
-    /* fence segment, 8 units along X */
-    begin_part(PROP_FENCE, TEX_WOOD, false, 0x8A6A44FF);
-    for (int i = -1; i <= 1; i++)
-        mb_box(v3(i * 3.9f - 0.1f, -0.4f, -0.1f), v3(i * 3.9f + 0.1f, 1.35f, 0.1f), 1.0f);
-    mb_box(v3(-4.0f, 0.45f, -0.06f), v3(4.0f, 0.6f, 0.06f), 1.0f);
-    mb_box(v3(-4.0f, 0.95f, -0.06f), v3(4.0f, 1.1f, 0.06f), 1.0f);
-    end_part();
-    meshes[PROP_FENCE].cull_r = 4.2f; meshes[PROP_FENCE].col = COL_BOX; meshes[PROP_FENCE].chx = 4.0f; meshes[PROP_FENCE].chz = 0.2f; meshes[PROP_FENCE].top = 1.3f;
-
-    /* village well */
-    begin_part(PROP_WELL, TEX_STONE, false, 0x9A948AFF);
-    mb_cyl(v3(0, -0.3f, 0), 1.0f, 1.2f, 8, 1.0f, false);
-    end_part();
-    begin_part(PROP_WELL, TEX_NONE, false, 0x203048FF);
-    mb_cyl(v3(0, 0.7f, 0), 0.85f, 0.01f, 8, 1.0f, true);
-    end_part();
-    begin_part(PROP_WELL, TEX_WOOD, false, 0x6A4A30FF);
-    mb_box(v3(-0.95f, 0.5f, -0.1f), v3(-0.75f, 2.6f, 0.1f), 1.0f);
-    mb_box(v3(0.75f, 0.5f, -0.1f), v3(0.95f, 2.6f, 0.1f), 1.0f);
-    mb_box(v3(-1.0f, 2.1f, -0.06f), v3(1.0f, 2.22f, 0.06f), 1.0f);
-    end_part();
-    begin_part(PROP_WELL, TEX_ROOF, true, 0);
-    mb_box_rot(v3(0, 2.75f, 0.55f), v3(1.3f, 0.08f, 0.7f), 0.55f, 0, 0, 1.0f);
-    mb_box_rot(v3(0, 2.75f, -0.55f), v3(1.3f, 0.08f, 0.7f), -0.55f, 0, 0, 1.0f);
-    end_part();
-    meshes[PROP_WELL].cull_r = 2.0f; meshes[PROP_WELL].col = COL_CIRCLE; meshes[PROP_WELL].cr = 1.1f; meshes[PROP_WELL].top = 1.0f;
-
-    /* brazier */
-    begin_part(PROP_BRAZIER, TEX_STONE, false, 0x7A7470FF);
-    mb_box(v3(-0.25f, -0.3f, -0.25f), v3(0.25f, 1.0f, 0.25f), 1.0f);
-    mb_cyl(v3(0, 1.0f, 0), 0.5f, 0.28f, 7, 1.0f, false);
-    end_part();
-    begin_part(PROP_BRAZIER, TEX_NONE, false, 0x1A1410FF);
-    mb_cyl(v3(0, 1.18f, 0), 0.42f, 0.01f, 7, 1.0f, true);
-    end_part();
-    meshes[PROP_BRAZIER].cull_r = 1.0f; meshes[PROP_BRAZIER].col = COL_CIRCLE; meshes[PROP_BRAZIER].cr = 0.45f; meshes[PROP_BRAZIER].top = 1.3f;
-
-    /* boulder blocking the hill path */
-    begin_part(PROP_BOULDER, TEX_STONE, false, 0x8E8678FF);
-    mb_blob(v3(0, 1.3f, 0), v3(2.5f, 2.1f, 2.2f), 7, 5, 1.2f);
-    mb_blob(v3(1.6f, 0.6f, 1.0f), v3(1.1f, 0.9f, 1.0f), 5, 3, 1.2f);
-    end_part();
-    meshes[PROP_BOULDER].cull_r = 3.0f; meshes[PROP_BOULDER].col = COL_CIRCLE; meshes[PROP_BOULDER].cr = 2.45f; meshes[PROP_BOULDER].top = 3.4f;
-
-    /* village gate */
-    begin_part(PROP_GATE, TEX_WOOD, false, 0x6A4A30FF);
-    mb_box(v3(-3.4f, -0.5f, -0.25f), v3(-2.9f, 4.2f, 0.25f), 1.0f);
-    mb_box(v3(2.9f, -0.5f, -0.25f), v3(3.4f, 4.2f, 0.25f), 1.0f);
-    mb_box(v3(-4.0f, 3.7f, -0.3f), v3(4.0f, 4.2f, 0.3f), 1.0f);
-    mb_set_color(0xA88A5AFF);
-    mb_box(v3(-1.6f, 2.8f, -0.1f), v3(1.6f, 3.6f, 0.1f), 1.0f);
-    end_part();
-    meshes[PROP_GATE].cull_r = 4.5f; meshes[PROP_GATE].col = COL_GATE; meshes[PROP_GATE].cr = 0.35f; meshes[PROP_GATE].top = 4.2f;
-
-    /* cart */
-    begin_part(PROP_CART, TEX_WOOD, false, 0x9A7448FF);
-    mb_box(v3(-0.9f, 0.6f, -1.4f), v3(0.9f, 1.25f, 1.4f), 1.0f);
-    mb_box(v3(-0.1f, 0.6f, 1.4f), v3(0.1f, 0.75f, 2.8f), 1.0f);
-    mb_set_color(0x5A4030FF);
-    for (int s = -1; s <= 1; s += 2) {
-        mb_box_rot(v3(s * 1.0f, 0.55f, 0), v3(0.08f, 0.55f, 0.55f), 0, 0, 0, 1.0f);
-        mb_box_rot(v3(s * 1.0f, 0.55f, 0), v3(0.08f, 0.55f, 0.55f), 0.785f, 0, 0, 1.0f);
+    switch (p->type) {
+    case PROP_HOUSE:     emit_house(6.0f, 5.0f, 3.2f, 5.3f, false, tint); break;
+    case PROP_HOUSE_BIG: emit_house(9.0f, 7.0f, 4.4f, 7.4f, true, tint); break;
+    case PROP_TREE:
+        if (part(TEX_BARK, 0x6A4A30FF)) mb_cyl(v3(0, -0.3f, 0), 0.32f, 3.4f, 4, 1.5f, false);
+        if (part(TEX_LEAVES, tint)) mb_blob(v3(0, 4.1f, 0), v3(2.0f, 1.9f, 2.0f), 6, 3, 1.5f);
+        break;
+    case PROP_PINE:
+        if (part(TEX_BARK, 0x5A4030FF)) mb_cyl(v3(0, -0.3f, 0), 0.25f, 1.8f, 4, 1.5f, false);
+        if (part(TEX_LEAVES, tint)) {
+            mb_cone(v3(0, 1.2f, 0), 1.9f, 2.9f, 5, 1.5f);
+            mb_cone(v3(0, 3.0f, 0), 1.3f, 2.6f, 5, 1.5f);
+        }
+        break;
+    case PROP_BIGTREE:
+        if (part(TEX_BARK, 0x6A4A30FF)) {
+            mb_cyl(v3(0, -0.5f, 0), 0.95f, 6.5f, 7, 2.0f, false);
+            mb_box_rot(v3(1.4f, 5.6f, 0), v3(1.6f, 0.25f, 0.25f), 0, 0, 0.6f, 1.0f);
+            mb_box_rot(v3(-1.3f, 6.0f, 0.4f), v3(1.5f, 0.22f, 0.22f), 0, 0.3f, -0.6f, 1.0f);
+        }
+        if (part(TEX_LEAVES, tint)) {
+            mb_blob(v3(0, 8.2f, 0), v3(5.0f, 3.2f, 5.0f), 7, 4, 2.0f);
+            mb_blob(v3(2.6f, 9.6f, 1.0f), v3(2.8f, 2.2f, 2.8f), 5, 3, 2.0f);
+            mb_blob(v3(-2.4f, 9.4f, -1.4f), v3(2.8f, 2.2f, 2.8f), 5, 3, 2.0f);
+        }
+        break;
+    case PROP_ROCK:
+        if (part(TEX_STONE, 0x8A8680FF)) mb_blob(v3(0, 0.15f, 0), v3(1.0f, 0.75f, 0.85f), 5, 3, 1.0f);
+        break;
+    case PROP_FENCE:
+        if (part(TEX_WOOD, 0x8A6A44FF)) {
+            for (int i = -1; i <= 1; i++)
+                mb_box(v3(i * 3.9f - 0.1f, -0.4f, -0.1f), v3(i * 3.9f + 0.1f, 1.35f, 0.1f), 1.0f);
+            for (int r = 0; r < 2; r++) {
+                float y0 = 0.45f + r * 0.5f, y1 = y0 + 0.15f;
+                mb_quad(v3(-4, y0, 0.06f), v3(4, y0, 0.06f), v3(4, y1, 0.06f), v3(-4, y1, 0.06f), v3(0, 0, 1), 1.0f);
+                mb_quad(v3(-4, y0, -0.06f), v3(4, y0, -0.06f), v3(4, y1, -0.06f), v3(-4, y1, -0.06f), v3(0, 0, -1), 1.0f);
+                mb_quad(v3(-4, y1, -0.06f), v3(4, y1, -0.06f), v3(4, y1, 0.06f), v3(-4, y1, 0.06f), v3(0, 1, 0), 1.0f);
+            }
+        }
+        break;
+    case PROP_WELL:
+        if (part(TEX_STONE, 0x9A948AFF)) mb_cyl(v3(0, -0.3f, 0), 1.0f, 1.2f, 8, 1.0f, false);
+        if (part(TEX_NONE, 0x203048FF)) mb_cyl(v3(0, 0.7f, 0), 0.85f, 0.01f, 8, 1.0f, true);
+        if (part(TEX_WOOD, 0x6A4A30FF)) {
+            mb_box(v3(-0.95f, 0.5f, -0.1f), v3(-0.75f, 2.6f, 0.1f), 1.0f);
+            mb_box(v3(0.75f, 0.5f, -0.1f), v3(0.95f, 2.6f, 0.1f), 1.0f);
+            mb_box(v3(-1.0f, 2.1f, -0.06f), v3(1.0f, 2.22f, 0.06f), 1.0f);
+        }
+        if (part(TEX_ROOF, tint)) {
+            mb_box_rot(v3(0, 2.75f, 0.55f), v3(1.3f, 0.08f, 0.7f), 0.55f, 0, 0, 1.0f);
+            mb_box_rot(v3(0, 2.75f, -0.55f), v3(1.3f, 0.08f, 0.7f), -0.55f, 0, 0, 1.0f);
+        }
+        break;
+    case PROP_BRAZIER:
+        if (part(TEX_STONE, 0x7A7470FF)) {
+            mb_box(v3(-0.25f, -0.3f, -0.25f), v3(0.25f, 1.0f, 0.25f), 1.0f);
+            mb_cyl(v3(0, 1.0f, 0), 0.5f, 0.28f, 7, 1.0f, false);
+        }
+        if (part(TEX_NONE, 0x1A1410FF)) mb_cyl(v3(0, 1.18f, 0), 0.42f, 0.01f, 7, 1.0f, true);
+        break;
+    case PROP_BOULDER:
+        if (part(TEX_STONE, 0x8E8678FF)) {
+            mb_blob(v3(0, 1.3f, 0), v3(2.5f, 2.1f, 2.2f), 7, 5, 1.2f);
+            mb_blob(v3(1.6f, 0.6f, 1.0f), v3(1.1f, 0.9f, 1.0f), 5, 3, 1.2f);
+        }
+        break;
+    case PROP_GATE:
+        if (part(TEX_WOOD, 0x6A4A30FF)) {
+            mb_box(v3(-3.4f, -0.5f, -0.25f), v3(-2.9f, 4.2f, 0.25f), 1.0f);
+            mb_box(v3(2.9f, -0.5f, -0.25f), v3(3.4f, 4.2f, 0.25f), 1.0f);
+            mb_box(v3(-4.0f, 3.7f, -0.3f), v3(4.0f, 4.2f, 0.3f), 1.0f);
+            mb_set_color(0xA88A5AFF);
+            mb_box(v3(-1.6f, 2.8f, -0.1f), v3(1.6f, 3.6f, 0.1f), 1.0f);
+        }
+        break;
+    case PROP_CART:
+        if (part(TEX_WOOD, 0x9A7448FF)) {
+            mb_box(v3(-0.9f, 0.6f, -1.4f), v3(0.9f, 1.25f, 1.4f), 1.0f);
+            mb_box(v3(-0.1f, 0.6f, 1.4f), v3(0.1f, 0.75f, 2.8f), 1.0f);
+            mb_set_color(0x5A4030FF);
+            for (int sd = -1; sd <= 1; sd += 2) {
+                mb_box_rot(v3(sd * 1.0f, 0.55f, 0), v3(0.08f, 0.55f, 0.55f), 0, 0, 0, 1.0f);
+                mb_box_rot(v3(sd * 1.0f, 0.55f, 0), v3(0.08f, 0.55f, 0.55f), 0.785f, 0, 0, 1.0f);
+            }
+        }
+        break;
+    case PROP_CRATE:
+        if (part(TEX_WOOD, 0xA87C4CFF)) mb_box(v3(-0.5f, -0.1f, -0.5f), v3(0.5f, 0.9f, 0.5f), 1.0f);
+        break;
+    case PROP_SIGN:
+        if (part(TEX_WOOD, 0x7A5A38FF)) {
+            mb_box(v3(-0.08f, -0.3f, -0.08f), v3(0.08f, 1.5f, 0.08f), 1.0f);
+            mb_set_color(0xB08C5CFF);
+            mb_box(v3(-0.7f, 1.0f, -0.05f), v3(0.7f, 1.6f, 0.07f), 1.0f);
+        }
+        break;
+    case PROP_DEADTREE:
+        if (part(TEX_BARK, 0x4A3A30FF)) {
+            mb_cone(v3(0, -0.3f, 0), 0.45f, 5.0f, 5, 1.0f);
+            mb_box_rot(v3(0.7f, 2.8f, 0), v3(0.9f, 0.1f, 0.1f), 0, 0, 0.7f, 1.0f);
+            mb_box_rot(v3(-0.6f, 3.4f, 0.2f), v3(0.8f, 0.09f, 0.09f), 0, 0.5f, -0.8f, 1.0f);
+            mb_box_rot(v3(0.1f, 2.0f, -0.6f), v3(0.7f, 0.08f, 0.08f), 0, 1.6f, 0.5f, 1.0f);
+        }
+        break;
+    case PROP_CRAG:
+        if (part(TEX_STONE, tint)) {
+            mb_cone(v3(0, -0.5f, 0), 1.6f, 5.5f, 6, 1.5f);
+            mb_blob(v3(0.6f, 0.3f, 0.4f), v3(1.3f, 1.0f, 1.2f), 5, 3, 1.5f);
+        }
+        break;
+    case PROP_HAY:
+        if (part(TEX_GRASS, 0xE0C060FF)) mb_cyl(v3(0, -0.2f, 0), 0.75f, 1.2f, 7, 1.0f, true);
+        break;
+    case PROP_BENCH:
+        if (part(TEX_WOOD, 0x8A6A44FF)) {
+            mb_box(v3(-1.0f, 0.45f, -0.25f), v3(1.0f, 0.6f, 0.25f), 1.0f);
+            mb_box(v3(-0.9f, -0.2f, -0.2f), v3(-0.75f, 0.45f, 0.2f), 1.0f);
+            mb_box(v3(0.75f, -0.2f, -0.2f), v3(0.9f, 0.45f, 0.2f), 1.0f);
+        }
+        break;
+    default:
+        break;
     }
-    end_part();
-    meshes[PROP_CART].cull_r = 3.0f; meshes[PROP_CART].col = COL_BOX; meshes[PROP_CART].chx = 1.1f; meshes[PROP_CART].chz = 1.5f; meshes[PROP_CART].top = 1.3f;
-
-    begin_part(PROP_CRATE, TEX_WOOD, false, 0xA87C4CFF);
-    mb_box(v3(-0.5f, -0.1f, -0.5f), v3(0.5f, 0.9f, 0.5f), 1.0f);
-    end_part();
-    meshes[PROP_CRATE].cull_r = 1.0f; meshes[PROP_CRATE].col = COL_BOX; meshes[PROP_CRATE].chx = 0.55f; meshes[PROP_CRATE].chz = 0.55f; meshes[PROP_CRATE].top = 0.9f;
-
-    begin_part(PROP_SIGN, TEX_WOOD, false, 0x7A5A38FF);
-    mb_box(v3(-0.08f, -0.3f, -0.08f), v3(0.08f, 1.5f, 0.08f), 1.0f);
-    mb_set_color(0xB08C5CFF);
-    mb_box(v3(-0.7f, 1.0f, -0.05f), v3(0.7f, 1.6f, 0.07f), 1.0f);
-    end_part();
-    meshes[PROP_SIGN].cull_r = 1.0f; meshes[PROP_SIGN].col = COL_CIRCLE; meshes[PROP_SIGN].cr = 0.2f; meshes[PROP_SIGN].top = 1.6f;
-
-    begin_part(PROP_DEADTREE, TEX_BARK, false, 0x4A3A30FF);
-    mb_cone(v3(0, -0.3f, 0), 0.45f, 5.0f, 5, 1.0f);
-    mb_box_rot(v3(0.7f, 2.8f, 0), v3(0.9f, 0.1f, 0.1f), 0, 0, 0.7f, 1.0f);
-    mb_box_rot(v3(-0.6f, 3.4f, 0.2f), v3(0.8f, 0.09f, 0.09f), 0, 0.5f, -0.8f, 1.0f);
-    mb_box_rot(v3(0.1f, 2.0f, -0.6f), v3(0.7f, 0.08f, 0.08f), 0, 1.6f, 0.5f, 1.0f);
-    end_part();
-    meshes[PROP_DEADTREE].cull_r = 3.0f; meshes[PROP_DEADTREE].col = COL_CIRCLE; meshes[PROP_DEADTREE].cr = 0.4f; meshes[PROP_DEADTREE].top = 5.0f;
-
-    begin_part(PROP_CRAG, TEX_STONE, true, 0);
-    mb_cone(v3(0, -0.5f, 0), 1.6f, 5.5f, 6, 1.5f);
-    mb_blob(v3(0.6f, 0.3f, 0.4f), v3(1.3f, 1.0f, 1.2f), 5, 3, 1.5f);
-    end_part();
-    meshes[PROP_CRAG].cull_r = 3.5f; meshes[PROP_CRAG].col = COL_CIRCLE; meshes[PROP_CRAG].cr = 1.4f; meshes[PROP_CRAG].top = 5.0f;
-
-    begin_part(PROP_HAY, TEX_GRASS, false, 0xE0C060FF);
-    mb_cyl(v3(0, -0.2f, 0), 0.75f, 1.2f, 7, 1.0f, true);
-    end_part();
-    meshes[PROP_HAY].cull_r = 1.2f; meshes[PROP_HAY].col = COL_CIRCLE; meshes[PROP_HAY].cr = 0.75f; meshes[PROP_HAY].top = 1.0f;
-
-    begin_part(PROP_BENCH, TEX_WOOD, false, 0x8A6A44FF);
-    mb_box(v3(-1.0f, 0.45f, -0.25f), v3(1.0f, 0.6f, 0.25f), 1.0f);
-    mb_box(v3(-0.9f, -0.2f, -0.2f), v3(-0.75f, 0.45f, 0.2f), 1.0f);
-    mb_box(v3(0.75f, -0.2f, -0.2f), v3(0.9f, 0.45f, 0.2f), 1.0f);
-    end_part();
-    meshes[PROP_BENCH].cull_r = 1.2f; meshes[PROP_BENCH].col = COL_BOX; meshes[PROP_BENCH].chx = 1.0f; meshes[PROP_BENCH].chz = 0.3f; meshes[PROP_BENCH].top = 0.6f;
 }
 
 /* ------------------------------------------------------------------ */
@@ -455,7 +426,7 @@ float world_height(float x, float z)
 
 static uint32_t light_color(uint32_t base, vec3_t n)
 {
-    float d = fmaxf(0.0f, v3_dot(n, g_world.sun_dir));
+    float d = fmaxf(0.0f, v3_dot(n, g_world.sun_dir)) * (g_world.storm ? 0.35f : 1.0f);
     uint32_t a = g_world.ambient, s = g_world.sun_color;
     float r = ((a >> 24) + (s >> 24) * d) / 255.0f;
     float g = (((a >> 16) & 0xFF) + ((s >> 16) & 0xFF) * d) / 255.0f;
@@ -463,14 +434,6 @@ static uint32_t light_color(uint32_t base, vec3_t n)
     int cr = (int)((base >> 24) * r), cg = (int)(((base >> 16) & 0xFF) * g), cb = (int)(((base >> 8) & 0xFF) * b);
     cr = cr > 255 ? 255 : cr; cg = cg > 255 ? 255 : cg; cb = cb > 255 ? 255 : cb;
     return ((uint32_t)cr << 24) | ((uint32_t)cg << 16) | ((uint32_t)cb << 8) | 0xFF;
-}
-
-static void terrain_vertex(int ix, int iz, int cx0, int cz0)
-{
-    uint32_t c = tcolors[iz][ix];
-    glColor4ub(c >> 24, (c >> 16) & 0xFF, (c >> 8) & 0xFF, 0xFF);
-    glTexCoord2f((float)(ix - cx0), (float)(iz - cz0));
-    glVertex3f(-MAP_HALF + ix * CELL, heights[iz][ix], -MAP_HALF + iz * CELL);
 }
 
 static void build_terrain(void)
@@ -488,24 +451,38 @@ static void build_terrain(void)
             tcolors[z][x] = light_color(shape_color(wx, wz, heights[z][x]), n);
         }
 
-    if (!lists_ready) chunk_lists = glGenLists(CHUNKS * CHUNKS);
+    /* each chunk is a 9x9 vertex grid drawn with indices, so every vertex is
+       transformed once by the RSP instead of once per triangle */
+    const int CV = CHUNK_CELLS + 1;
+    static gfx_vtx_t verts[(CHUNK_CELLS + 1) * (CHUNK_CELLS + 1)];
+    static uint16_t idx[CHUNK_CELLS * CHUNK_CELLS * 6];
+    int ni = 0;
+    for (int z = 0; z < CHUNK_CELLS; z++)
+        for (int x = 0; x < CHUNK_CELLS; x++) {
+            uint16_t a = z * CV + x, b = z * CV + x + 1, c = (z + 1) * CV + x, d = (z + 1) * CV + x + 1;
+            /* CCW seen from above, split along the (x,z)-(x+1,z+1) diagonal like world_height() */
+            idx[ni++] = a; idx[ni++] = d; idx[ni++] = b;
+            idx[ni++] = a; idx[ni++] = c; idx[ni++] = d;
+        }
+
     for (int cz = 0; cz < CHUNKS; cz++)
         for (int cx = 0; cx < CHUNKS; cx++) {
-            glNewList(chunk_lists + cz * CHUNKS + cx, GL_COMPILE);
-            glBegin(GL_TRIANGLES);
             int x0 = cx * CHUNK_CELLS, z0 = cz * CHUNK_CELLS;
-            for (int z = z0; z < z0 + CHUNK_CELLS; z++)
-                for (int x = x0; x < x0 + CHUNK_CELLS; x++) {
-                    /* CCW seen from above: (x,z) -> (x,z+1) -> (x+1,z+1) */
-                    terrain_vertex(x, z, x0, z0);
-                    terrain_vertex(x + 1, z + 1, x0, z0);
-                    terrain_vertex(x + 1, z, x0, z0);
-                    terrain_vertex(x, z, x0, z0);
-                    terrain_vertex(x, z + 1, x0, z0);
-                    terrain_vertex(x + 1, z + 1, x0, z0);
+            for (int z = 0; z < CV; z++)
+                for (int x = 0; x < CV; x++) {
+                    gfx_vtx_t *v = &verts[z * CV + x];
+                    v->p[0] = -MAP_HALF + (x0 + x) * CELL;
+                    v->p[1] = heights[z0 + z][x0 + x];
+                    v->p[2] = -MAP_HALF + (z0 + z) * CELL;
+                    v->t[0] = (float)x;
+                    v->t[1] = (float)z;
+                    v->n[0] = 0; v->n[1] = 1; v->n[2] = 0;
+                    v->c = tcolors[z0 + z][x0 + x] | 0xFF;
                 }
-            glEnd();
-            glEndList();
+            dl_free(chunk_lists[cz * CHUNKS + cx]);
+            dl_begin();
+            gfx_draw_indexed(verts, CV * CV, idx, ni, true, false);
+            chunk_lists[cz * CHUNKS + cx] = dl_end();
         }
 }
 
@@ -513,8 +490,8 @@ static void build_sky(void)
 {
     static const float elev[] = { -0.5f, -0.02f, 0.18f, 0.55f, 1.0f, 1.5708f };
     const int SEG = 10, NR = sizeof(elev) / sizeof(elev[0]);
-    if (!lists_ready) sky_list = glGenLists(1);
-    glNewList(sky_list, GL_COMPILE);
+    dl_free(sky_list);
+    dl_begin();
     glBegin(GL_TRIANGLES);
     for (int r = 0; r < NR - 1; r++) {
         for (int s = 0; s < SEG; s++) {
@@ -538,7 +515,7 @@ static void build_sky(void)
         }
     }
     glEnd();
-    glEndList();
+    sky_list = dl_end();
 }
 
 /* ------------------------------------------------------------------ */
@@ -554,7 +531,7 @@ static prop_t *add_prop(prop_type_t t, float x, float z, float rot, float scale)
     p->y = world_height(x, z);
     if (t == PROP_HOUSE || t == PROP_HOUSE_BIG) {
         /* sit on the lowest corner so nothing floats */
-        float hx = meshes[t].chx, hz = meshes[t].chz;
+        float hx = PROP_INFO[t].chx, hz = PROP_INFO[t].chz;
         float m = p->y;
         for (int i = 0; i < 4; i++)
             m = fminf(m, world_height(x + ((i & 1) ? hx : -hx), z + ((i & 2) ? hz : -hz)));
@@ -576,7 +553,7 @@ static bool spot_clear(float x, float z, float min_prop_dist, float min_path)
     if (path_dist(x, z) < min_path) return false;
     for (int i = 0; i < nprops; i++) {
         float dx = props[i].x - x, dz = props[i].z - z;
-        float need = min_prop_dist + meshes[props[i].type].cull_r * 0.5f;
+        float need = min_prop_dist + PROP_INFO[props[i].type].cull_r * 0.5f;
         if (dx * dx + dz * dz < need * need) return false;
     }
     return true;
@@ -663,15 +640,15 @@ static void populate_village(void)
         float a = i * TAU_F / 6 + 0.3f;
         add_prop(PROP_ROCK, -30 + cosf(a) * 7.5f, 30 + sinf(a) * 7.5f, a, 0.5f + (i % 3) * 0.2f);
     }
-    scatter(PROP_TREE, 34, 3.5f, 4.0f, village_tree_ok, 0.85f, 1.25f);
-    scatter(PROP_PINE, 12, 3.5f, 4.0f, village_tree_ok, 0.9f, 1.3f);
+    scatter(PROP_TREE, 26, 3.5f, 4.0f, village_tree_ok, 0.85f, 1.25f);
+    scatter(PROP_PINE, 9, 3.5f, 4.0f, village_tree_ok, 0.9f, 1.3f);
     scatter(PROP_ROCK, 8, 3.0f, 3.0f, village_tree_ok, 0.6f, 1.2f);
 }
 
 static void populate_forest(void)
 {
-    scatter(PROP_PINE, 46, 3.0f, 3.5f, forest_tree_ok, 0.9f, 1.5f);
-    scatter(PROP_TREE, 22, 3.2f, 3.5f, forest_tree_ok, 0.9f, 1.4f);
+    scatter(PROP_PINE, 38, 3.0f, 3.5f, forest_tree_ok, 0.9f, 1.5f);
+    scatter(PROP_TREE, 16, 3.2f, 3.5f, forest_tree_ok, 0.9f, 1.4f);
     scatter(PROP_ROCK, 12, 2.5f, 3.0f, forest_tree_ok, 0.6f, 1.4f);
     add_prop(PROP_ROCK, -6, -8, 0, 1.4f);
     add_prop(PROP_ROCK, 7, 9, 1, 1.1f);
@@ -720,11 +697,11 @@ static void set_map_info(map_id_t id)
         w->name = "Buena Village";
         if (calamity) {
             w->sky_top = 0x1A0A30FF; w->sky_horizon = 0xC0508AFF; w->fog_color = 0x8A4A86FF;
-            w->fog_start = 18; w->fog_end = 62;
+            w->fog_start = 14; w->fog_end = 50;
             w->sun_color = 0xC090E0FF; w->ambient = 0x584468FF;
         } else {
             w->sky_top = 0x3A76D6FF; w->sky_horizon = 0xB0D6F2FF; w->fog_color = 0xBCDAF0FF;
-            w->fog_start = 26; w->fog_end = 66;
+            w->fog_start = 18; w->fog_end = 52;
             w->sun_color = 0xFFF2DCFF; w->ambient = 0x707A8CFF;
         }
         w->water_level = -1.2f;
@@ -732,29 +709,31 @@ static void set_map_info(map_id_t id)
     case MAP_FOREST:
         w->name = "Fittoa Forest";
         w->sky_top = 0x3E7AC0FF; w->sky_horizon = 0x9EC2D2FF; w->fog_color = 0x6C8A78FF;
-        w->fog_start = 14; w->fog_end = 50;
+        w->fog_start = 10; w->fog_end = 44;
         w->sun_color = 0xE8F0D0FF; w->ambient = 0x546856FF;
         break;
     case MAP_PLATEAU:
         w->name = "Western Plateau";
         w->sky_top = 0x2A62C4FF; w->sky_horizon = 0xC4DEF2FF; w->fog_color = 0xC2D8EEFF;
-        w->fog_start = 30; w->fog_end = 85;
+        w->fog_start = 22; w->fog_end = 60;
         w->sun_color = 0xFFF4E4FF; w->ambient = 0x707888FF;
         break;
     case MAP_DEMON:
     default:
         w->name = "Demon Continent";
         w->sky_top = 0x3A1426FF; w->sky_horizon = 0xD07050FF; w->fog_color = 0xB06048FF;
-        w->fog_start = 20; w->fog_end = 64;
+        w->fog_start = 16; w->fog_end = 52;
         w->sun_color = 0xFFD0A8FF; w->ambient = 0x6A4444FF;
         w->sun_dir = v3_norm(v3(-0.5f, 0.45f, -0.6f));
         break;
     }
 }
 
+void bake_props(void);
+static uint32_t prop_tint(const prop_t *p, int idx);
+
 void world_init(void)
 {
-    build_meshes();
 }
 
 void world_set_palette_calamity(bool on)
@@ -786,6 +765,8 @@ void world_load(map_id_t id)
     case MAP_PLATEAU: populate_plateau(); break;
     default:          populate_demon(); break;
     }
+    bake_props();
+    baked_storm = false;
 }
 
 /* ------------------------------------------------------------------ */
@@ -796,7 +777,7 @@ static bool prop_solid(const prop_t *p)
 {
     if (p->flags & PF_NOCOLL) return false;
     if (p->type == PROP_BOULDER && (p->flags & PF_BROKEN)) return false;
-    return meshes[p->type].col != COL_NONE;
+    return PROP_INFO[p->type].col != COL_NONE;
 }
 
 static bool push_circle(vec3_t *pos, float cx, float cz, float r)
@@ -833,9 +814,9 @@ bool world_collide(vec3_t *pos, float radius)
         const prop_t *p = &props[i];
         if (!prop_solid(p)) continue;
         float dx = pos->x - p->x, dz = pos->z - p->z;
-        float reach = meshes[p->type].cull_r * p->scale + radius + 1.0f;
+        float reach = PROP_INFO[p->type].cull_r * p->scale + radius + 1.0f;
         if (dx * dx + dz * dz > reach * reach) continue;
-        const prop_mesh_t *m = &meshes[p->type];
+        const prop_info_t *m = &PROP_INFO[p->type];
         switch (m->col) {
         case COL_CIRCLE:
             hit |= push_circle(pos, p->x, p->z, m->cr * p->scale + radius);
@@ -866,7 +847,7 @@ bool world_solid_at(vec3_t pt, float radius)
     for (int i = 0; i < nprops; i++) {
         const prop_t *p = &props[i];
         if (!prop_solid(p)) continue;
-        const prop_mesh_t *m = &meshes[p->type];
+        const prop_info_t *m = &PROP_INFO[p->type];
         if (pt.y > p->y + m->top * p->scale) continue;
         vec3_t q = pt;
         bool in = false;
@@ -950,7 +931,7 @@ void world_update(float dt)
         if ((p->type == PROP_HOUSE || p->type == PROP_HOUSE_BIG) && p->t > 0.5f && g_world.id == MAP_VILLAGE) {
             p->t = 0;
             if (dist_xz(v3(p->x, 0, p->z), g_player.pos) < 35) {
-                const prop_mesh_t *m = &meshes[p->type];
+                const prop_info_t *m = &PROP_INFO[p->type];
                 float lx = m->chx * 0.45f + 0.4f, lz = -m->chz * 0.5f + 0.4f;
                 float c = cosf(p->rot), s = sinf(p->rot);
                 vec3_t top = v3(p->x + lx * c + lz * s, p->y + m->top + 0.8f, p->z - lx * s + lz * c);
@@ -959,6 +940,12 @@ void world_update(float dt)
         }
     }
 
+    if (g_world.storm && !baked_storm) {
+        /* the sun goes behind the clouds: re-light the terrain and props */
+        baked_storm = true;
+        build_terrain();
+        bake_props();
+    }
     if (g_world.storm) {
         g_world.storm_t += dt;
         g_world.lightning = fmaxf(0, g_world.lightning - dt * 3.0f);
@@ -1004,7 +991,7 @@ void world_render_sky(void)
     if (!g_world.storm || g_world.storm_t < 0.6f) {
         glPushMatrix();
         glTranslatef(eye.x, eye.y, eye.z);
-        glCallList(sky_list);
+        dl_call(sky_list);
         glPopMatrix();
     }
     glEnable(GL_CULL_FACE);
@@ -1086,12 +1073,102 @@ static uint32_t prop_tint(const prop_t *p, int idx)
     return c;
 }
 
+/* Static props are baked per terrain chunk and per texture into display
+   lists, with the sun lighting pre-computed into vertex colors. Drawing the
+   whole village is then a handful of list calls with no per-prop CPU work. */
+static dlist_t bake_list[CHUNKS * CHUNKS][NPASS];   /* NULL = nothing to draw */
+static dlist_t boulder_list;
+static int boulder_idx = -1;
+
+static int chunk_of(float x, float z)
+{
+    int cx = (int)((x + MAP_HALF) / (CHUNK_CELLS * CELL));
+    int cz = (int)((z + MAP_HALF) / (CHUNK_CELLS * CELL));
+    cx = cx < 0 ? 0 : (cx >= CHUNKS ? CHUNKS - 1 : cx);
+    cz = cz < 0 ? 0 : (cz >= CHUNKS ? CHUNKS - 1 : cz);
+    return cz * CHUNKS + cx;
+}
+
+static int emit_chunk_pass(int c)
+{
+    mb_begin(0xFFFFFFFF);
+    for (int i = 0; i < nprops; i++) {
+        const prop_t *p = &props[i];
+        if (p->type == PROP_BOULDER) { boulder_idx = i; continue; }
+        if (chunk_of(p->x, p->z) != c) continue;
+        mb_base(p->x, p->y, p->z, p->rot, p->scale);
+        emit_prop(p, prop_tint(p, i));
+    }
+    int n = mb_emitted();
+    mb_end();
+    return n;
+}
+
+void bake_props(void)
+{
+    rspq_wait();
+    for (int c = 0; c < CHUNKS * CHUNKS; c++)
+        for (int k = 0; k < NPASS; k++)
+            if (bake_list[c][k]) { dl_free(bake_list[c][k]); bake_list[c][k] = NULL; }
+    if (boulder_list) { dl_free(boulder_list); boulder_list = NULL; }
+    boulder_idx = -1;
+
+    uint32_t sun = g_world.storm ? color_mul(g_world.sun_color, 0.35f) : g_world.sun_color;
+    mb_bake_lighting(true, g_world.sun_dir, sun, g_world.ambient);
+    mb_skip_bottoms(true);
+    for (int c = 0; c < CHUNKS * CHUNKS; c++) {
+        for (int k = 0; k < NPASS; k++) {
+            cur_pass = PASS_ORDER[k];
+            /* dry run first so that only non-empty lists are created */
+            mb_set_dry(true);
+            int n = emit_chunk_pass(c);
+            mb_set_dry(false);
+            if (!n) continue;
+            dl_begin();
+            emit_chunk_pass(c);
+            bake_list[c][k] = dl_end();
+        }
+    }
+    if (boulder_idx >= 0) {
+        const prop_t *p = &props[boulder_idx];
+        cur_pass = TEX_STONE;
+        dl_begin();
+        mb_begin(0xFFFFFFFF);
+        mb_base(p->x, p->y, p->z, p->rot, p->scale);
+        emit_prop(p, 0);
+        mb_end();
+        boulder_list = dl_end();
+    }
+    mb_base_identity();
+    mb_skip_bottoms(false);
+    mb_bake_lighting(false, g_world.sun_dir, 0, 0);
+}
+
+static bool chunk_visible(int cx, int cz)
+{
+    float half = CHUNK_CELLS * CELL * 0.5f;
+    vec3_t c = v3(-MAP_HALF + (cx * CHUNK_CELLS) * CELL + half, 0, -MAP_HALF + (cz * CHUNK_CELLS) * CELL + half);
+    c.y = heights[cz * CHUNK_CELLS + CHUNK_CELLS / 2][cx * CHUNK_CELLS + CHUNK_CELLS / 2] + 2.0f;
+    return gfx_visible(c, half * 1.45f + 3.0f, g_world.fog_end);
+}
+
+void world_restore_ambient(void)
+{
+    uint32_t a = g_world.ambient;
+    GLfloat amb[4] = { (a >> 24) / 255.0f, ((a >> 16) & 0xFF) / 255.0f, ((a >> 8) & 0xFF) / 255.0f, 1 };
+    if (g_world.lightning > 0) for (int i = 0; i < 3; i++) amb[i] = fminf(1.0f, amb[i] + g_world.lightning * 0.6f);
+    glLightModelfv(GL_LIGHT_MODEL_AMBIENT, amb);
+}
+
 void world_render(void)
 {
-    vec3_t eye = g_cam.override ? g_cam.ov_pos : g_cam.pos;
     uint32_t fog = g_world.storm ? storm_mix(g_world.fog_color, 1.0f) : g_world.fog_color;
     apply_fog(fog);
+#ifdef EXP_NOFOG
+    glDisable(GL_FOG);
+#else
     glEnable(GL_FOG);
+#endif
 
     /* sun light for lit objects (set while the modelview is the view matrix) */
     float sd = g_world.storm ? 0.45f : 1.0f;
@@ -1104,46 +1181,31 @@ void world_render(void)
     glLightfv(GL_LIGHT0, GL_DIFFUSE, dif);
     glLightModelfv(GL_LIGHT_MODEL_AMBIENT, amb);
 
-    /* terrain: baked vertex lighting */
+    /* terrain and props: lighting is baked into vertex colors */
     glDisable(GL_LIGHTING);
-    gfx_bind(ground_tex);
+    bool vis[CHUNKS * CHUNKS];
     for (int cz = 0; cz < CHUNKS; cz++)
-        for (int cx = 0; cx < CHUNKS; cx++) {
-            float half = CHUNK_CELLS * CELL * 0.5f;
-            vec3_t c = v3(-MAP_HALF + (cx * CHUNK_CELLS) * CELL + half, eye.y, -MAP_HALF + (cz * CHUNK_CELLS) * CELL + half);
-            c.y = heights[cz * CHUNK_CELLS + CHUNK_CELLS / 2][cx * CHUNK_CELLS + CHUNK_CELLS / 2];
-            if (!gfx_visible(c, half * 1.5f, g_world.fog_end)) continue;
-            glCallList(chunk_lists + cz * CHUNKS + cx);
-        }
+        for (int cx = 0; cx < CHUNKS; cx++)
+            vis[cz * CHUNKS + cx] = chunk_visible(cx, cz);
 
-    /* props, batched per texture */
-    glEnable(GL_LIGHTING);
-    nvisible = 0;
-    for (int i = 0; i < nprops; i++) {
-        const prop_t *p = &props[i];
-        if (p->type == PROP_BOULDER && (p->flags & PF_BROKEN)) continue;
-        float r = meshes[p->type].cull_r * p->scale;
-        if (gfx_visible(v3(p->x, p->y + r * 0.5f, p->z), r, g_world.fog_end + 2)) visible[nvisible++] = i;
-    }
-    for (unsigned pass = 0; pass < sizeof(PASS_ORDER) / sizeof(PASS_ORDER[0]); pass++) {
-        tex_id_t tex = PASS_ORDER[pass];
+    gfx_bind(ground_tex);
+    for (int c = 0; c < CHUNKS * CHUNKS; c++)
+        if (vis[c]) dl_call(chunk_lists[c]);
+
+    for (int k = 0; k < NPASS; k++) {
         bool bound = false;
-        for (int v = 0; v < nvisible; v++) {
-            const prop_t *p = &props[visible[v]];
-            const prop_mesh_t *m = &meshes[p->type];
-            for (int k = 0; k < m->nparts; k++) {
-                if (m->parts[k].tex != tex) continue;
-                if (!bound) { gfx_bind(tex); bound = true; }
-                if (m->parts[k].tinted) gl_color(prop_tint(p, visible[v]));
-                glPushMatrix();
-                glTranslatef(p->x, p->y, p->z);
-                if (p->rot != 0) glRotatef(p->rot * RAD2DEG, 0, 1, 0);
-                if (p->scale != 1.0f) glScalef(p->scale, p->scale, p->scale);
-                glCallList(m->parts[k].list);
-                glPopMatrix();
-            }
+        for (int c = 0; c < CHUNKS * CHUNKS; c++) {
+            if (!vis[c] || !bake_list[c][k]) continue;
+            if (!bound) { gfx_bind(PASS_ORDER[k]); bound = true; }
+            dl_call(bake_list[c][k]);
         }
     }
+    if (boulder_idx >= 0 && !(props[boulder_idx].flags & PF_BROKEN) &&
+        gfx_visible(v3(props[boulder_idx].x, props[boulder_idx].y + 1.5f, props[boulder_idx].z), 3.0f, g_world.fog_end)) {
+        gfx_bind(TEX_STONE);
+        dl_call(boulder_list);
+    }
+    glEnable(GL_LIGHTING);
     gfx_bind(TEX_NONE);
     render_water();
 }

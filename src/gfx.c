@@ -7,7 +7,7 @@
 camera_t g_cam;
 
 static GLuint textures[TEX_COUNT];
-static GLuint prim_lists;
+static dlist_t prim_lists[PRIM_COUNT];
 static int bound_tex = -1;
 static sprite_t *spr_circle, *spr_ring, *spr_logo;
 
@@ -45,14 +45,187 @@ typedef struct { vec3_t p, n; float u, v; } vtx_t;
 
 static inline vtx_t V(vec3_t p, vec3_t n, float u, float v) { return (vtx_t){p, n, u, v}; }
 
-static uint32_t mb_color = 0;   /* mesh builder: 0 = keep the current color */
+/*
+ * Mesh batching. Triangles are collected into a vertex/index buffer with
+ * duplicate vertices merged, then submitted with glDrawElements so the RSP's
+ * vertex cache can reuse transformed vertices (immediate mode would transform
+ * three vertices for every triangle). Recorded inside display lists, the
+ * vertex data is copied into the list, so the buffers are reused.
+ */
+typedef gfx_vtx_t mvtx_t;
+
+#define MB_MAX_V   1024
+#define MB_MAX_I   3072
+#define MB_HASH    2048
+
+static mvtx_t *mb_v;
+static uint16_t *mb_i;
+static int16_t *mb_hash;
+static int mb_nv, mb_ni;
+static bool mb_any_color;
+static uint32_t mb_color = 0;   /* 0 = use the current GL color when the list runs */
+
+static void mb_reset(void)
+{
+    if (!mb_v) {
+        mb_v = malloc(sizeof(mvtx_t) * MB_MAX_V);
+        mb_i = malloc(sizeof(uint16_t) * MB_MAX_I);
+        mb_hash = malloc(sizeof(int16_t) * MB_HASH);
+    }
+    mb_nv = mb_ni = 0;
+    mb_any_color = false;
+    memset(mb_hash, 0xFF, sizeof(int16_t) * MB_HASH);
+}
+
+void gfx_draw_indexed(const void *verts, int nv, const uint16_t *idx, int ni, bool color, bool normals)
+{
+    /* Normals are always supplied so that only two vertex formats exist
+       (with and without per-vertex color): every format switch makes the
+       RSP pipeline regenerate its vertex loader. */
+    (void)nv; (void)normals;
+    const mvtx_t *v = verts;
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    glEnableClientState(GL_NORMAL_ARRAY);
+    glVertexPointer(3, GL_FLOAT, sizeof(mvtx_t), v[0].p);
+    glTexCoordPointer(2, GL_FLOAT, sizeof(mvtx_t), v[0].t);
+    glNormalPointer(GL_FLOAT, sizeof(mvtx_t), v[0].n);
+    if (color) {
+        glEnableClientState(GL_COLOR_ARRAY);
+        glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(mvtx_t), &v[0].c);
+    }
+    glDrawElements(GL_TRIANGLES, ni, GL_UNSIGNED_SHORT, idx);
+    glDisableClientState(GL_VERTEX_ARRAY);
+    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+    glDisableClientState(GL_NORMAL_ARRAY);
+    glDisableClientState(GL_COLOR_ARRAY);
+}
+
+static int mb_total;              /* indices emitted since mb_begin */
+
+/* builder transform: p' = M p + t, n' = N n (N = inverse transpose of M) */
+static float xb[12] = { 1,0,0,0, 0,1,0,0, 0,0,1,0 };   /* base (row-major 3x4) */
+static float xl[12] = { 1,0,0,0, 0,1,0,0, 0,0,1,0 };   /* local part */
+static float xm[12] = { 1,0,0,0, 0,1,0,0, 0,0,1,0 };   /* effective = base * local */
+static float xn[9]  = { 1,0,0, 0,1,0, 0,0,1 };
+static bool x_ident = true;
+
+/* optional lighting baked into vertex colors */
+static bool bake_on;
+static vec3_t bake_sun;
+static float bake_sun_rgb[3], bake_amb_rgb[3];
+
+static void xf_update(void)
+{
+    for (int r = 0; r < 3; r++) {
+        for (int c = 0; c < 3; c++)
+            xm[r * 4 + c] = xb[r * 4 + 0] * xl[0 * 4 + c] + xb[r * 4 + 1] * xl[1 * 4 + c] + xb[r * 4 + 2] * xl[2 * 4 + c];
+        xm[r * 4 + 3] = xb[r * 4 + 0] * xl[3] + xb[r * 4 + 1] * xl[7] + xb[r * 4 + 2] * xl[11] + xb[r * 4 + 3];
+    }
+    /* inverse transpose of the 3x3 part (cofactor matrix; the scale is irrelevant since we normalize) */
+    const float a = xm[0], b = xm[1], c = xm[2], d = xm[4], e = xm[5], f = xm[6], g = xm[8], h = xm[9], i = xm[10];
+    xn[0] = e * i - f * h; xn[1] = f * g - d * i; xn[2] = d * h - e * g;
+    xn[3] = c * h - b * i; xn[4] = a * i - c * g; xn[5] = b * g - a * h;
+    xn[6] = b * f - c * e; xn[7] = c * d - a * f; xn[8] = a * e - b * d;
+    x_ident = false;
+}
+
+static void xf_compose(float *out, float x, float y, float z, float rx, float ry, float rz, float sx, float sy, float sz)
+{
+    /* T * Ry * Rx * Rz * S, row-major 3x4 */
+    float cx = cosf(rx), sxn = sinf(rx), cy = cosf(ry), syn = sinf(ry), cz = cosf(rz), szn = sinf(rz);
+    float r[9] = {
+        cy * cz + syn * sxn * szn, -cy * szn + syn * sxn * cz, syn * cx,
+        cx * szn,                  cx * cz,                    -sxn,
+        -syn * cz + cy * sxn * szn, syn * szn + cy * sxn * cz, cy * cx,
+    };
+    for (int row = 0; row < 3; row++) {
+        out[row * 4 + 0] = r[row * 3 + 0] * sx;
+        out[row * 4 + 1] = r[row * 3 + 1] * sy;
+        out[row * 4 + 2] = r[row * 3 + 2] * sz;
+    }
+    out[3] = x; out[7] = y; out[11] = z;
+}
+
+void mb_base(float x, float y, float z, float ry, float scale)
+{
+    xf_compose(xb, x, y, z, 0, ry, 0, scale, scale, scale);
+    xf_update();
+}
+
+void mb_base_identity(void)
+{
+    static const float I[12] = { 1,0,0,0, 0,1,0,0, 0,0,1,0 };
+    memcpy(xb, I, sizeof(I));
+    memcpy(xl, I, sizeof(I));
+    memcpy(xm, I, sizeof(I));
+    static const float NI[9] = { 1,0,0, 0,1,0, 0,0,1 };
+    memcpy(xn, NI, sizeof(NI));
+    x_ident = true;
+}
+
+void mb_bake_lighting(bool on, vec3_t sun_dir, uint32_t sun, uint32_t ambient)
+{
+    bake_on = on;
+    bake_sun = v3_norm(sun_dir);
+    for (int k = 0; k < 3; k++) {
+        bake_sun_rgb[k] = ((sun >> (24 - 8 * k)) & 0xFF) / 255.0f;
+        bake_amb_rgb[k] = ((ambient >> (24 - 8 * k)) & 0xFF) / 255.0f;
+    }
+}
+
+static bool mb_dry;
+void mb_set_dry(bool on) { mb_dry = on; }
+
+static void mb_flush(void)
+{
+    if (mb_ni > 0 && !mb_dry) gfx_draw_indexed(mb_v, mb_nv, mb_i, mb_ni, mb_any_color || bake_on, !bake_on);
+    mb_total += mb_ni;
+}
+
+int mb_emitted(void) { return mb_total + mb_ni; }
+
+static uint16_t mb_add(const mvtx_t *m)
+{
+    const uint32_t *w = (const uint32_t *)m;
+    uint32_t h = 2166136261u;
+    for (unsigned k = 0; k < sizeof(mvtx_t) / 4; k++) h = (h ^ w[k]) * 16777619u;
+    h &= MB_HASH - 1;
+    while (mb_hash[h] >= 0) {
+        if (!memcmp(&mb_v[mb_hash[h]], m, sizeof(mvtx_t))) return (uint16_t)mb_hash[h];
+        h = (h + 1) & (MB_HASH - 1);
+    }
+    mb_v[mb_nv] = *m;
+    mb_hash[h] = (int16_t)mb_nv;
+    return (uint16_t)mb_nv++;
+}
 
 static void put_vtx(vtx_t v)
 {
-    if (mb_color) gl_color(mb_color);
-    glNormal3f(v.n.x, v.n.y, v.n.z);
-    glTexCoord2f(v.u, v.v);
-    glVertex3f(v.p.x, v.p.y, v.p.z);
+    if (mb_nv + 1 > MB_MAX_V || mb_ni + 1 > MB_MAX_I) mb_flush();
+    if (!x_ident) {
+        vec3_t p = v.p, n = v.n;
+        v.p = v3(xm[0] * p.x + xm[1] * p.y + xm[2] * p.z + xm[3],
+                 xm[4] * p.x + xm[5] * p.y + xm[6] * p.z + xm[7],
+                 xm[8] * p.x + xm[9] * p.y + xm[10] * p.z + xm[11]);
+        v.n = v3_norm(v3(xn[0] * n.x + xn[1] * n.y + xn[2] * n.z,
+                         xn[3] * n.x + xn[4] * n.y + xn[5] * n.z,
+                         xn[6] * n.x + xn[7] * n.y + xn[8] * n.z));
+    }
+    uint32_t col = mb_color ? mb_color : 0xFFFFFFFF;
+    if (bake_on) {
+        float d = fmaxf(0.0f, v3_dot(v.n, bake_sun));
+        uint32_t out = col & 0xFF;
+        for (int k = 0; k < 3; k++) {
+            float ch = ((col >> (24 - 8 * k)) & 0xFF) * (bake_amb_rgb[k] + bake_sun_rgb[k] * d);
+            out |= (uint32_t)(ch > 255 ? 255 : ch) << (24 - 8 * k);
+        }
+        col = out;
+        v.n = v3(0, 1, 0);   /* normals are not uploaded for baked meshes */
+    }
+    mvtx_t m = { { v.p.x, v.p.y, v.p.z }, { v.u, v.v }, { v.n.x, v.n.y, v.n.z }, col };
+    if (mb_color) mb_any_color = true;
+    mb_i[mb_ni++] = mb_add(&m);
 }
 
 /* Emit a triangle, fixing the winding so that it faces along its normals. */
@@ -61,6 +234,8 @@ static void emit_tri(vtx_t a, vtx_t b, vtx_t c)
     vec3_t fn = v3_cross(v3_sub(b.p, a.p), v3_sub(c.p, a.p));
     vec3_t avg = v3_add(v3_add(a.n, b.n), c.n);
     if (v3_dot(fn, avg) < 0) { vtx_t t = b; b = c; c = t; }
+    /* keep the three vertices of a triangle in the same batch */
+    if (mb_nv + 3 > MB_MAX_V || mb_ni + 3 > MB_MAX_I) mb_flush();
     put_vtx(a); put_vtx(b); put_vtx(c);
 }
 
@@ -70,10 +245,9 @@ static void emit_quad(vtx_t a, vtx_t b, vtx_t c, vtx_t d)
     emit_tri(a, c, d);
 }
 
-static void build_cube(void)
+static void emit_cube(void)
 {
     static const float N[6][3] = { {1,0,0}, {-1,0,0}, {0,1,0}, {0,-1,0}, {0,0,1}, {0,0,-1} };
-    glBegin(GL_TRIANGLES);
     for (int f = 0; f < 6; f++) {
         vec3_t n = v3(N[f][0], N[f][1], N[f][2]);
         /* two tangent axes */
@@ -88,13 +262,11 @@ static void build_cube(void)
         }
         emit_quad(V(p[0], n, 0, 0), V(p[1], n, 1, 0), V(p[2], n, 1, 1), V(p[3], n, 0, 1));
     }
-    glEnd();
 }
 
-static void build_sphere(void)
+static void emit_sphere(void)
 {
-    const int SEG = 8, RING = 5;
-    glBegin(GL_TRIANGLES);
+    const int SEG = 7, RING = 4;
     for (int r = 0; r < RING; r++) {
         float a0 = PI_F * r / RING - PI_F / 2, a1 = PI_F * (r + 1) / RING - PI_F / 2;
         for (int s = 0; s < SEG; s++) {
@@ -114,13 +286,11 @@ static void build_sphere(void)
             else                     emit_quad(A, B, C, D);
         }
     }
-    glEnd();
 }
 
-static void build_cylinder(void)
+static void emit_cylinder(void)
 {
     const int SEG = 6;
-    glBegin(GL_TRIANGLES);
     for (int s = 0; s < SEG; s++) {
         float b0 = TAU_F * s / SEG, b1 = TAU_F * (s + 1) / SEG;
         vec3_t n0 = v3(cosf(b0), 0, sinf(b0)), n1 = v3(cosf(b1), 0, sinf(b1));
@@ -135,13 +305,11 @@ static void build_cylinder(void)
         emit_tri(V(v3(0, 0, 0), dn, 0.5f, 0.5f), V(p0, dn, 0.5f + n0.x * 0.5f, 0.5f + n0.z * 0.5f),
                  V(p1, dn, 0.5f + n1.x * 0.5f, 0.5f + n1.z * 0.5f));
     }
-    glEnd();
 }
 
-static void build_cone(void)
+static void emit_cone(void)
 {
     const int SEG = 6;
-    glBegin(GL_TRIANGLES);
     for (int s = 0; s < SEG; s++) {
         float b0 = TAU_F * s / SEG, b1 = TAU_F * (s + 1) / SEG, bm = (b0 + b1) * 0.5f;
         vec3_t n0 = v3_norm(v3(cosf(b0), 0.5f, sinf(b0)));
@@ -154,15 +322,13 @@ static void build_cone(void)
         emit_tri(V(v3(0, 0, 0), dn, 0.5f, 0.5f), V(p0, dn, 0.5f + cosf(b0) * 0.5f, 0.5f + sinf(b0) * 0.5f),
                  V(p1, dn, 0.5f + cosf(b1) * 0.5f, 0.5f + sinf(b1) * 0.5f));
     }
-    glEnd();
 }
 
 /* cone with the tip cut off: radius 0.5 at y=0, 0.25 at y=1 (robes, skirts) */
-static void build_frustum(void)
+static void emit_frustum(void)
 {
     const int SEG = 8;
     const float rb = 0.5f, rt = 0.25f;
-    glBegin(GL_TRIANGLES);
     for (int s = 0; s < SEG; s++) {
         float b0 = TAU_F * s / SEG, b1 = TAU_F * (s + 1) / SEG;
         vec3_t n0 = v3_norm(v3(cosf(b0), rb - rt, sinf(b0)));
@@ -175,28 +341,45 @@ static void build_frustum(void)
         emit_tri(V(v3(0, 1, 0), up, 0.5f, 0.5f), V(q0, up, 0, 0), V(q1, up, 1, 0));
         emit_tri(V(v3(0, 0, 0), dn, 0.5f, 0.5f), V(p0, dn, 0, 1), V(p1, dn, 1, 1));
     }
-    glEnd();
 }
 
-static void build_disc(void)
+/* smooth-shaded box: 8 shared vertices instead of 24 (limbs, torsos) */
+static void emit_sbox(void)
 {
-    const int SEG = 12;
+    vtx_t c[8];
+    for (int i = 0; i < 8; i++) {
+        vec3_t p = v3((i & 1) ? 0.5f : -0.5f, (i & 2) ? 0.5f : -0.5f, (i & 4) ? 0.5f : -0.5f);
+        c[i] = V(p, v3_norm(p), (i & 1) ? 1.0f : 0.0f, (i & 2) ? 0.0f : 1.0f);
+    }
+    static const uint8_t F[6][4] = { {1,3,7,5}, {0,4,6,2}, {2,6,7,3}, {0,1,5,4}, {4,5,7,6}, {0,2,3,1} };
+    for (int f = 0; f < 6; f++) emit_quad(c[F[f][0]], c[F[f][1]], c[F[f][2]], c[F[f][3]]);
+}
+
+/* unit quad in the XY plane facing +Z (eyes, decals) */
+static void emit_quadp(void)
+{
+    vec3_t n = v3(0, 0, 1);
+    emit_quad(V(v3(-0.5f, -0.5f, 0), n, 0, 1), V(v3(0.5f, -0.5f, 0), n, 1, 1),
+              V(v3(0.5f, 0.5f, 0), n, 1, 0), V(v3(-0.5f, 0.5f, 0), n, 0, 0));
+}
+
+static void emit_disc(void)
+{
+    const int SEG = 8;
     vec3_t up = v3(0, 1, 0);
-    glBegin(GL_TRIANGLES);
     for (int s = 0; s < SEG; s++) {
         float b0 = TAU_F * s / SEG, b1 = TAU_F * (s + 1) / SEG;
         emit_tri(V(v3(0, 0, 0), up, 0.5f, 0.5f),
                  V(v3(cosf(b0) * 0.5f, 0, sinf(b0) * 0.5f), up, 0.5f + cosf(b0) * 0.5f, 0.5f + sinf(b0) * 0.5f),
                  V(v3(cosf(b1) * 0.5f, 0, sinf(b1) * 0.5f), up, 0.5f + cosf(b1) * 0.5f, 0.5f + sinf(b1) * 0.5f));
     }
-    glEnd();
 }
 
-static void build_octa(void)
+static void emit_octa(void)
 {
     vec3_t top = v3(0, 0.5f, 0), bot = v3(0, -0.5f, 0);
     vec3_t ring[4] = { v3(0.5f, 0, 0), v3(0, 0, 0.5f), v3(-0.5f, 0, 0), v3(0, 0, -0.5f) };
-    glBegin(GL_TRIANGLES);
+    mb_reset();
     for (int i = 0; i < 4; i++) {
         vec3_t a = ring[i], b = ring[(i + 1) & 3];
         vec3_t nt = v3_norm(v3_add(v3_add(a, b), top));
@@ -204,16 +387,34 @@ static void build_octa(void)
         emit_tri(V(a, nt, 0, 1), V(b, nt, 1, 1), V(top, nt, 0.5f, 0));
         emit_tri(V(a, nb, 0, 0), V(b, nb, 1, 0), V(bot, nb, 0.5f, 1));
     }
-    glEnd();
 }
 
 /* ------------------------------------------------------------------ */
 /* Mesh builder (used to compile props into display lists)             */
 /* ------------------------------------------------------------------ */
 
-void mb_begin(uint32_t color) { mb_color = color; glBegin(GL_TRIANGLES); }
+void mb_begin(uint32_t color) { mb_reset(); mb_total = 0; mb_color = color; }
+
+static void (*const PRIM_EMIT[PRIM_COUNT])(void) = {
+    emit_cube, emit_sphere, emit_cylinder, emit_cone, emit_disc, emit_octa, emit_frustum, emit_sbox, emit_quadp,
+};
+
+/* emit a unit primitive with a local transform (relative to the base) */
+void mb_prim(prim_t p, uint32_t color, float x, float y, float z, float rx, float ry, float rz,
+             float sx, float sy, float sz)
+{
+    xf_compose(xl, x, y, z, rx, ry, rz, sx, sy, sz);
+    xf_update();
+    uint32_t keep = mb_color;
+    mb_color = color;
+    PRIM_EMIT[p]();
+    mb_color = keep;
+    static const float I[12] = { 1,0,0,0, 0,1,0,0, 0,0,1,0 };
+    memcpy(xl, I, sizeof(I));
+    xf_update();
+}
 void mb_set_color(uint32_t color) { mb_color = color; }
-void mb_end(void) { glEnd(); mb_color = 0; }
+void mb_end(void) { mb_flush(); mb_color = 0; }
 
 static vec3_t rot3(vec3_t v, float rx, float ry, float rz)
 {
@@ -225,6 +426,9 @@ static vec3_t rot3(vec3_t v, float rx, float ry, float rz)
     return v;
 }
 
+static bool skip_bottoms;
+void mb_skip_bottoms(bool on) { skip_bottoms = on; }
+
 void mb_box_rot(vec3_t c, vec3_t half, float rx, float ry, float rz, float ts)
 {
     vec3_t ax[3] = { rot3(v3(1, 0, 0), rx, ry, rz), rot3(v3(0, 1, 0), rx, ry, rz), rot3(v3(0, 0, 1), rx, ry, rz) };
@@ -233,6 +437,7 @@ void mb_box_rot(vec3_t c, vec3_t half, float rx, float ry, float rz, float ts)
         int b = (a + 1) % 3, d = (a + 2) % 3;
         for (int sgn = -1; sgn <= 1; sgn += 2) {
             vec3_t n = v3_scale(ax[a], (float)sgn);
+            if (skip_bottoms && n.y < -0.9f) continue;   /* faces the ground: never visible */
             vec3_t fc = v3_add(c, v3_scale(n, h[a]));
             vec3_t eb = v3_scale(ax[b], h[b]), ed = v3_scale(ax[d], h[d]);
             float ub = 2 * h[b] / ts, ud = 2 * h[d] / ts;
@@ -347,12 +552,12 @@ void gfx_init(void)
     }
     glBindTexture(GL_TEXTURE_2D, 0);
 
-    prim_lists = glGenLists(PRIM_COUNT);
-    void (*builders[PRIM_COUNT])(void) = { build_cube, build_sphere, build_cylinder, build_cone, build_disc, build_octa, build_frustum };
     for (int i = 0; i < PRIM_COUNT; i++) {
-        glNewList(prim_lists + i, GL_COMPILE);
-        builders[i]();
-        glEndList();
+        dl_begin();
+        mb_begin(0);
+        PRIM_EMIT[i]();
+        mb_end();
+        prim_lists[i] = dl_end();
     }
 
     spr_circle = sprite_load("rom:/ui_circle.sprite");
@@ -379,6 +584,12 @@ void gfx_init(void)
     g_cam.pitch = 0.32f;
 }
 
+void dl_free(dlist_t l)
+{
+    /* the RSP may still be executing the block: free it once it's done */
+    if (l) rdpq_call_deferred((void (*)(void *))rspq_block_free, l);
+}
+
 void gfx_bind(tex_id_t t)
 {
     if ((int)t == bound_tex) return;
@@ -393,16 +604,17 @@ void gfx_bind(tex_id_t t)
 
 void gfx_prim(prim_t p)
 {
-    glCallList(prim_lists + p);
+    dl_call(prim_lists[p]);
 }
 
 void gfx_part(prim_t p, uint32_t color, float x, float y, float z, float sx, float sy, float sz)
 {
     gl_color(color);
+    /* translate + scale in a single matrix upload */
+    const GLfloat m[16] = { sx, 0, 0, 0,  0, sy, 0, 0,  0, 0, sz, 0,  x, y, z, 1 };
     glPushMatrix();
-    glTranslatef(x, y, z);
-    glScalef(sx, sy, sz);
-    glCallList(prim_lists + p);
+    glMultMatrixf(m);
+    dl_call(prim_lists[p]);
     glPopMatrix();
 }
 
@@ -410,13 +622,20 @@ void gfx_part_rot(prim_t p, uint32_t color, float x, float y, float z,
                   float rx, float ry, float rz, float sx, float sy, float sz)
 {
     gl_color(color);
+    /* M = T * Ry * Rx * Rz * S, built on the CPU and uploaded once */
+    float cx = cosf(rx), sxn = sinf(rx), cy = cosf(ry), syn = sinf(ry), cz = cosf(rz), szn = sinf(rz);
+    float r00 = cy * cz + syn * sxn * szn, r01 = -cy * szn + syn * sxn * cz, r02 = syn * cx;
+    float r10 = cx * szn,                  r11 = cx * cz,                    r12 = -sxn;
+    float r20 = -syn * cz + cy * sxn * szn, r21 = syn * szn + cy * sxn * cz, r22 = cy * cx;
+    const GLfloat m[16] = {
+        r00 * sx, r10 * sx, r20 * sx, 0,
+        r01 * sy, r11 * sy, r21 * sy, 0,
+        r02 * sz, r12 * sz, r22 * sz, 0,
+        x, y, z, 1,
+    };
     glPushMatrix();
-    glTranslatef(x, y, z);
-    if (ry != 0) glRotatef(ry * RAD2DEG, 0, 1, 0);
-    if (rx != 0) glRotatef(rx * RAD2DEG, 1, 0, 0);
-    if (rz != 0) glRotatef(rz * RAD2DEG, 0, 0, 1);
-    glScalef(sx, sy, sz);
-    glCallList(prim_lists + p);
+    glMultMatrixf(m);
+    dl_call(prim_lists[p]);
     glPopMatrix();
 }
 
@@ -523,7 +742,7 @@ void gfx_billboards_begin(void)
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDepthMask(GL_FALSE);
     gfx_bind(TEX_GLOW);
-    glBegin(GL_TRIANGLES);
+    glBegin(GL_QUADS);
 }
 
 void gfx_billboard(vec3_t p, float size, uint32_t color)
@@ -534,8 +753,6 @@ void gfx_billboard(vec3_t p, float size, uint32_t color)
     gl_color(color);
     glTexCoord2f(0, 1); glVertex3f(a.x, a.y, a.z);
     glTexCoord2f(1, 1); glVertex3f(b.x, b.y, b.z);
-    glTexCoord2f(1, 0); glVertex3f(c.x, c.y, c.z);
-    glTexCoord2f(0, 1); glVertex3f(a.x, a.y, a.z);
     glTexCoord2f(1, 0); glVertex3f(c.x, c.y, c.z);
     glTexCoord2f(0, 0); glVertex3f(d.x, d.y, d.z);
 }
@@ -556,7 +773,7 @@ void gfx_shadow(vec3_t p, float radius, float ground_y)
     glPushMatrix();
     glTranslatef(p.x, ground_y + 0.06f, p.z);
     glScalef(radius * 2 * k, 1, radius * 2 * k);
-    glCallList(prim_lists + PRIM_DISC);
+    dl_call(prim_lists[PRIM_DISC]);
     glPopMatrix();
 }
 

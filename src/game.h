@@ -105,7 +105,7 @@ enum { FONT_BODY = 1, FONT_OUTLINE = 2, FONT_TITLE = 3 };
 /* font styles (same ids registered on every font) */
 enum { STYLE_WHITE, STYLE_GOLD, STYLE_GRAY, STYLE_BLUE, STYLE_RED, STYLE_GREEN, STYLE_PINK, STYLE_DARK };
 
-typedef enum { PRIM_CUBE, PRIM_SPHERE, PRIM_CYLINDER, PRIM_CONE, PRIM_DISC, PRIM_OCTA, PRIM_FRUSTUM, PRIM_COUNT } prim_t;
+typedef enum { PRIM_CUBE, PRIM_SPHERE, PRIM_CYLINDER, PRIM_CONE, PRIM_DISC, PRIM_OCTA, PRIM_FRUSTUM, PRIM_SBOX, PRIM_QUAD, PRIM_COUNT } prim_t;
 
 typedef struct {
     vec3_t pos, target;
@@ -136,6 +136,21 @@ void gfx_billboards_end(void);
 void gfx_shadow(vec3_t p, float radius, float ground_y);
 void gfx_end_frame_3d(void);
 
+/*
+ * Display lists. These are libdragon RSP command blocks recorded from GL
+ * calls. We keep the block pointers ourselves instead of going through
+ * glGenLists/glCallList ids (the id map misbehaved with hundreds of lists).
+ */
+typedef rspq_block_t *dlist_t;
+static inline void dl_begin(void) { rspq_block_begin(); }
+static inline dlist_t dl_end(void) { return rspq_block_end(); }
+static inline void dl_call(dlist_t l) { if (l) rspq_block_run(l); }
+void dl_free(dlist_t l);
+
+/* interleaved vertex used for indexed drawing */
+typedef struct { float p[3]; float t[2]; float n[3]; uint32_t c; } gfx_vtx_t;
+void gfx_draw_indexed(const void *verts, int nv, const uint16_t *idx, int ni, bool color, bool normals);
+
 /* mesh builder for compiling static props into display lists */
 void mb_begin(uint32_t color);       /* color 0: use the current GL color */
 void mb_set_color(uint32_t color);
@@ -147,6 +162,14 @@ void mb_cone(vec3_t base, float r, float h, int seg, float ts);
 void mb_blob(vec3_t center, vec3_t radii, int seg, int rings, float ts);
 void mb_tri(vec3_t a, vec3_t b, vec3_t c, vec3_t outward, float ts);
 void mb_quad(vec3_t a, vec3_t b, vec3_t c, vec3_t d, vec3_t outward, float ts);
+void mb_prim(prim_t p, uint32_t color, float x, float y, float z, float rx, float ry, float rz,
+             float sx, float sy, float sz);       /* unit primitive with a local transform */
+void mb_base(float x, float y, float z, float ry, float scale);   /* transform for everything emitted */
+void mb_base_identity(void);
+void mb_bake_lighting(bool on, vec3_t sun_dir, uint32_t sun, uint32_t ambient);
+int  mb_emitted(void);
+void mb_skip_bottoms(bool on);
+void mb_set_dry(bool on);             /* count geometry without issuing GL calls */        /* drop downward faces (they rest on the ground) */
 
 /* 2D helpers, call after gfx_end_frame_3d */
 void ui_rect(int x0, int y0, int x1, int y1, uint32_t color);      /* opaque */
@@ -228,6 +251,7 @@ void world_render(void);
 void world_render_sky(void);
 void world_render_fx(void);            /* rain etc, after opaque geometry */
 uint32_t world_clear_color(void);
+void world_restore_ambient(void);        /* undo a hit-flash ambient boost */
 float world_height(float x, float z);
 bool world_collide(vec3_t *pos, float radius);       /* push out of solids, returns true if hit */
 bool world_solid_at(vec3_t p, float radius);          /* projectile test */
@@ -347,6 +371,10 @@ void story_on_enemy_killed(int type);
 void story_on_player_dead(void);
 bool story_wants_credits(void);
 const char *story_interact_hint(void);
+void story_respawn(void);
+void story_render_fx(void);           /* NPC shadows */
+bool story_card_active(void);
+void story_debug_start(int step);     /* test builds: jump straight to a story step */
 
 /* ------------------------------------------------------------------ */
 /* Dialogue / HUD / menus (ui.c)                                       */
@@ -405,6 +433,7 @@ extern save_t g_save;
 void save_init(void);
 bool save_available(void);
 bool save_exists(void);
+bool save_load(void);
 bool save_write(void);
 void save_reset(void);
 

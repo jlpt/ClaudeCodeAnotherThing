@@ -1,6 +1,10 @@
 /*
  * Low-poly characters and creatures, assembled from the unit primitives in
  * gfx.c with simple hierarchical (joint) animation - the classic early N64 look.
+ *
+ * Each model is built once at boot into rigid segments (body, arms, legs),
+ * each a single display list with vertex colors, so animating a character
+ * costs only a handful of matrix uploads per frame.
  */
 #include "game.h"
 
@@ -34,87 +38,123 @@ static const human_desc_t HUMANS[MDL_HUMAN_COUNT] = {
     [MDL_BULLY_C]       = { 0xE0B088FF, 0x6A4A2AFF, 0xC8A83AFF, 0x4A3B2AFF, 0x3A2A1EFF, 0xC8A83AFF, 0x2A2030FF, HS_SHORT,  OUT_TUNIC, HAT_NONE,  W_NONE,      1.05f, false, false },
 };
 
-static float cur_flash;
+/* ------------------------------------------------------------------ */
+/* Helpers                                                             */
+/* ------------------------------------------------------------------ */
 
-static uint32_t C(uint32_t c)
+static void P(prim_t p, uint32_t col, float x, float y, float z, float sx, float sy, float sz)
 {
-    if (cur_flash <= 0) return c;
-    return color_mix(c, 0xFFFFFFFF, clampf(cur_flash, 0, 1) * 0.8f);
+    mb_prim(p, col, x, y, z, 0, 0, 0, sx, sy, sz);
 }
 
-static void part(prim_t p, uint32_t col, float x, float y, float z, float sx, float sy, float sz)
+static void PR(prim_t p, uint32_t col, float x, float y, float z, float rx, float ry, float rz,
+               float sx, float sy, float sz)
 {
-    gfx_part(p, C(col), x, y, z, sx, sy, sz);
+    mb_prim(p, col, x, y, z, rx, ry, rz, sx, sy, sz);
 }
 
-static void part_r(prim_t p, uint32_t col, float x, float y, float z, float rx, float ry, float rz,
-                   float sx, float sy, float sz)
+static void begin_list(void)
 {
-    gfx_part_rot(p, C(col), x, y, z, rx, ry, rz, sx, sy, sz);
+    dl_begin();
+    mb_begin(0xFFFFFFFF);
 }
 
-/* A limb hanging from a joint, rotated around X (forward swing) and Z (spread). */
-static void limb(uint32_t col, float jx, float jy, float jz, float swing, float spread,
-                 float w, float len, float d)
+static dlist_t end_list(void)
 {
-    glPushMatrix();
-    glTranslatef(jx, jy, jz);
-    if (spread != 0) glRotatef(spread * RAD2DEG, 0, 0, 1);
-    if (swing != 0) glRotatef(swing * RAD2DEG, 1, 0, 0);
-    part(PRIM_CUBE, col, 0, -len * 0.5f, 0, w, len, d);
-    glPopMatrix();
+    mb_end();
+    return dl_end();
 }
 
-void models_init(void) { }
-
-static void draw_weapon(const human_desc_t *d, float arm_len, float H, anim_t anim)
+/* glMultMatrix(T * Ry * Rx * Rz * S) in one upload */
+static void mult_trs(float x, float y, float z, float rx, float ry, float rz, float sc)
 {
+    float cx = cosf(rx), sx = sinf(rx), cy = cosf(ry), sy = sinf(ry), cz = cosf(rz), sz = sinf(rz);
+    float r00 = cy * cz + sy * sx * sz, r01 = -cy * sz + sy * sx * cz, r02 = sy * cx;
+    float r10 = cx * sz,                r11 = cx * cz,                 r12 = -sx;
+    float r20 = -sy * cz + cy * sx * sz, r21 = sy * sz + cy * sx * cz, r22 = cy * cx;
+    const GLfloat m[16] = {
+        r00 * sc, r10 * sc, r20 * sc, 0,
+        r01 * sc, r11 * sc, r21 * sc, 0,
+        r02 * sc, r12 * sc, r22 * sc, 0,
+        x, y, z, 1,
+    };
+    glMultMatrixf(m);
+}
+
+/* limb joint: T * Rz(spread) * Rx(swing) */
+static void mult_joint(float x, float y, float z, float rz, float rx)
+{
+    float cx = cosf(rx), sx = sinf(rx), cz = cosf(rz), sz = sinf(rz);
+    const GLfloat m[16] = {
+        cz, sz, 0, 0,
+        -sz * cx, cz * cx, sx, 0,
+        sz * sx, -cz * sx, cx, 0,
+        x, y, z, 1,
+    };
+    glMultMatrixf(m);
+}
+
+static void flash_begin(float flash)
+{
+    if (flash <= 0) return;
+    float k = 0.6f + flash * 0.6f;
+    GLfloat amb[4] = { k, k, k, 1 };
+    glLightModelfv(GL_LIGHT_MODEL_AMBIENT, amb);
+}
+
+static void flash_end(float flash)
+{
+    if (flash > 0) world_restore_ambient();
+}
+
+/* ------------------------------------------------------------------ */
+/* Humans                                                              */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    dlist_t body, leg, arm_l, arm_r, arm_r_cast;
+    float hip_y, leg_x, sh_y, arm_x;
+} human_lists_t;
+
+static human_lists_t HL[MDL_HUMAN_COUNT];
+
+static void emit_weapon(const human_desc_t *d, float arm_len, float H, bool cast)
+{
+    /* the weapon hangs from the fist: (0, -arm_len) in arm space, tilted forward */
+    float tilt = cast ? 0.0f : -80.0f * PI_F / 180.0f;
+    float ct = cosf(tilt), st = sinf(tilt);
+    /* place a part at (u along weapon axis) relative to the fist */
+    #define AT(u) 0.0f, -arm_len + (u) * ct, 0.02f + (u) * st
     switch (d->weapon) {
     case W_STAFF:
     case W_STAFF_GEM: {
-        /* staff held in the fist, mostly vertical */
-        glPushMatrix();
-        glTranslatef(0, -arm_len, 0.02f);
-        glRotatef(anim == ANIM_CAST ? 0 : -80, 1, 0, 0);
         float len = H * 0.95f;
-        part(PRIM_CYLINDER, 0x7A5432FF, 0, -len * 0.35f, 0, 0.06f, len, 0.06f);
+        PR(PRIM_CYLINDER, 0x7A5432FF, AT(-len * 0.35f), tilt, 0, 0, 0.06f, len, 0.06f);
         uint32_t gem = d->weapon == W_STAFF_GEM ? 0x50A0FFFF : 0xE0C070FF;
-        part(PRIM_SPHERE, gem, 0, len * 0.65f + 0.03f, 0, 0.13f, 0.13f, 0.13f);
-        glPopMatrix();
+        P(PRIM_OCTA, gem, AT(len * 0.65f + 0.04f), 0.14f, 0.18f, 0.14f);
         break;
     }
     case W_SWORD:
-        glPushMatrix();
-        glTranslatef(0, -arm_len, 0.02f);
-        glRotatef(-80, 1, 0, 0);
-        part(PRIM_CUBE, 0x5A4030FF, 0, 0.0f, 0, 0.06f, 0.2f, 0.06f);
-        part(PRIM_CUBE, 0xB0A060FF, 0, 0.11f, 0, 0.26f, 0.05f, 0.07f);
-        part(PRIM_CUBE, 0xD8DCE8FF, 0, 0.55f, 0, 0.08f, 0.8f, 0.03f);
-        glPopMatrix();
+        PR(PRIM_CUBE, 0x5A4030FF, AT(0.0f), tilt, 0, 0, 0.06f, 0.2f, 0.06f);
+        PR(PRIM_CUBE, 0xB0A060FF, AT(0.11f), tilt, 0, 0, 0.26f, 0.05f, 0.07f);
+        PR(PRIM_CUBE, 0xD8DCE8FF, AT(0.55f), tilt, 0, 0, 0.08f, 0.8f, 0.03f);
         break;
     case W_SPEAR:
-        glPushMatrix();
-        glTranslatef(0, -arm_len, 0.02f);
-        glRotatef(-80, 1, 0, 0);
-        part(PRIM_CYLINDER, 0xE8E6DCFF, 0, -0.9f, 0, 0.06f, 2.4f, 0.06f);
-        part(PRIM_CONE, 0xF4F4FFFF, 0, 1.5f, 0, 0.12f, 0.35f, 0.12f);
-        part(PRIM_CONE, 0xF4F4FFFF, 0.09f, 1.4f, 0, 0.06f, 0.2f, 0.06f);
-        part(PRIM_CONE, 0xF4F4FFFF, -0.09f, 1.4f, 0, 0.06f, 0.2f, 0.06f);
-        glPopMatrix();
+        PR(PRIM_CYLINDER, 0xE8E6DCFF, AT(-0.9f), tilt, 0, 0, 0.06f, 2.4f, 0.06f);
+        PR(PRIM_CONE, 0xF4F4FFFF, AT(1.5f), tilt, 0, 0, 0.12f, 0.35f, 0.12f);
         break;
     default:
         break;
     }
+    #undef AT
 }
 
-void draw_human(human_model_t m, vec3_t pos, float yaw, anim_t anim, float t, float flash)
+static void build_human(human_model_t mdl)
 {
-    const human_desc_t *d = &HUMANS[m];
+    const human_desc_t *d = &HUMANS[mdl];
+    human_lists_t *L = &HL[mdl];
     const float H = d->height;
     const bool child = H < 1.3f;
-    cur_flash = flash;
-
-    /* proportions */
     const float hip_y = H * (child ? 0.40f : 0.47f);
     const float leg_len = hip_y;
     const float torso_h = H * (child ? 0.28f : 0.31f);
@@ -125,8 +165,113 @@ void draw_human(human_model_t m, vec3_t pos, float yaw, anim_t anim, float t, fl
     const float arm_len = H * (child ? 0.33f : 0.36f);
     const float limb_w = H * 0.085f;
 
-    /* animation */
-    float leg_sw = 0, arm_sw = 0, bob = 0, lean = 0;
+    L->hip_y = hip_y;
+    L->leg_x = torso_w * 0.24f;
+    L->sh_y = sh_y;
+    L->arm_x = torso_w * 0.5f + limb_w * 0.55f;
+
+    /* body: everything that moves with the root */
+    begin_list();
+    switch (d->outfit) {
+    case OUT_ROBE:
+        P(PRIM_FRUSTUM, d->top, 0, hip_y * 0.25f, 0, torso_w * 1.5f, hip_y * 0.85f, torso_d * 2.2f);
+        break;
+    case OUT_DRESS:
+        P(PRIM_FRUSTUM, d->bottom, 0, hip_y * 0.12f, 0, torso_w * 1.9f, hip_y * 0.95f, torso_d * 2.8f);
+        break;
+    case OUT_MAID:
+        P(PRIM_FRUSTUM, d->bottom, 0, hip_y * 0.15f, 0, torso_w * 1.8f, hip_y * 0.92f, torso_d * 2.6f);
+        P(PRIM_CUBE, d->accent, 0, hip_y * 0.55f, torso_d * 0.62f, torso_w * 0.8f, hip_y * 0.7f, 0.02f);
+        break;
+    default:
+        P(PRIM_CUBE, d->bottom, 0, hip_y - 0.02f, 0, torso_w * 1.02f, 0.12f, torso_d * 1.05f);
+        break;
+    }
+    P(PRIM_SBOX, d->top, 0, hip_y + torso_h * 0.5f, 0, torso_w, torso_h, torso_d);
+    if (d->outfit == OUT_VEST)
+        P(PRIM_SBOX, d->accent, 0, hip_y + torso_h * 0.5f, 0, torso_w * 1.06f, torso_h * 0.8f, torso_d * 1.1f);
+    if (d->outfit == OUT_ROBE)
+        P(PRIM_SBOX, d->accent, 0, sh_y, 0.01f, torso_w * 0.9f, 0.06f, torso_d * 1.15f);
+    P(PRIM_SBOX, 0x3A2A1AFF, 0, hip_y + 0.02f, 0, torso_w * 1.04f, 0.05f, torso_d * 1.08f);
+
+    P(PRIM_SPHERE, d->skin, 0, head_y, 0, head * 0.9f, head, head * 0.92f);
+    float ey = head_y + head * 0.02f, ez = head * 0.42f, ex = head * 0.18f;
+    P(PRIM_QUAD, d->eyes, ex, ey, ez + 0.012f, head * 0.1f, head * 0.16f, 1);
+    P(PRIM_QUAD, d->eyes, -ex, ey, ez + 0.012f, head * 0.1f, head * 0.16f, 1);
+    if (d->elf_ears) {
+        PR(PRIM_CONE, d->skin, head * 0.45f, head_y, 0, 0, 0, -1.3f, 0.07f, head * 0.35f, 0.05f);
+        PR(PRIM_CONE, d->skin, -head * 0.45f, head_y, 0, 0, 0, 1.3f, 0.07f, head * 0.35f, 0.05f);
+    }
+    if (d->gem) P(PRIM_OCTA, 0xFF3030FF, 0, head_y + head * 0.28f, head * 0.44f, 0.07f, 0.09f, 0.05f);
+
+    if (d->hair_style != HS_BALD) {
+        P(PRIM_SPHERE, d->hair, 0, head_y + head * 0.1f, -head * 0.08f, head * 0.98f, head * 0.92f, head);
+        switch (d->hair_style) {
+        case HS_SPIKY:
+            for (int i = -1; i <= 1; i++)
+                PR(PRIM_CONE, d->hair, i * head * 0.25f, head_y + head * 0.3f, -head * 0.2f,
+                   -1.0f, 0, i * 0.4f, head * 0.3f, head * 0.45f, head * 0.3f);
+            break;
+        case HS_LONG:
+            P(PRIM_CUBE, d->hair, 0, head_y - head * 0.45f, -head * 0.32f, head * 0.85f, head * 1.3f, head * 0.3f);
+            break;
+        case HS_BRAIDS:
+            for (int sd = -1; sd <= 1; sd += 2) {
+                P(PRIM_CYLINDER, d->hair, sd * head * 0.42f, head_y - head * 1.25f, -head * 0.1f,
+                  head * 0.2f, head * 1.25f, head * 0.2f);
+                P(PRIM_CUBE, d->accent, sd * head * 0.42f, head_y - head * 1.27f, -head * 0.1f,
+                  head * 0.16f, head * 0.1f, head * 0.16f);
+            }
+            break;
+        case HS_PONY:
+            PR(PRIM_CONE, d->hair, 0, head_y + head * 0.15f, -head * 0.5f, 2.6f, 0, 0,
+               head * 0.35f, head * 1.0f, head * 0.35f);
+            break;
+        case HS_BUN:
+            P(PRIM_SPHERE, d->hair, 0, head_y + head * 0.25f, -head * 0.5f, head * 0.45f, head * 0.45f, head * 0.45f);
+            break;
+        default:
+            break;
+        }
+    }
+    switch (d->hat) {
+    case HAT_WITCH:
+        P(PRIM_DISC, 0x4A3222FF, 0, head_y + head * 0.4f, -head * 0.05f, head * 2.3f, 1, head * 2.3f);
+        PR(PRIM_CONE, 0x5A3E2BFF, 0, head_y + head * 0.38f, -head * 0.08f, -0.25f, 0, 0,
+           head * 1.05f, head * 1.25f, head * 1.05f);
+        P(PRIM_CYLINDER, 0xD8C890FF, 0, head_y + head * 0.4f, -head * 0.06f, head * 1.07f, head * 0.12f, head * 1.07f);
+        break;
+    case HAT_BAND:
+        P(PRIM_CYLINDER, 0x6A2A2AFF, 0, head_y + head * 0.12f, 0, head * 0.95f, head * 0.12f, head * 0.97f);
+        break;
+    default:
+        break;
+    }
+    L->body = end_list();
+
+    /* leg in hip-joint space */
+    begin_list();
+    P(PRIM_SBOX, d->bottom, 0, -leg_len * 0.45f, 0, limb_w * 1.1f, leg_len * 0.9f, limb_w * 1.15f);
+    P(PRIM_SBOX, d->shoes, 0, -leg_len + 0.04f, 0.03f, limb_w * 1.2f, 0.09f, limb_w * 1.7f);
+    L->leg = end_list();
+
+    /* arms in shoulder-joint space */
+    for (int k = 0; k < 3; k++) {
+        dlist_t l;
+        begin_list();
+        P(PRIM_SBOX, d->top, 0, -arm_len * 0.4f, 0, limb_w, arm_len * 0.8f, limb_w);
+        P(PRIM_SBOX, d->skin, 0, -arm_len * 0.9f, 0, limb_w * 0.9f, arm_len * 0.22f, limb_w * 0.9f);
+        if (k > 0) emit_weapon(d, arm_len, H, k == 2);
+        l = end_list();
+        if (k == 0) L->arm_l = l; else if (k == 1) L->arm_r = l; else L->arm_r_cast = l;
+    }
+}
+
+void draw_human(human_model_t m, vec3_t pos, float yaw, anim_t anim, float t, float flash)
+{
+    const human_lists_t *L = &HL[m];
+
+    float leg_sw = 0, bob = 0, lean = 0;
     float r_arm = 0, l_arm = 0, r_spread = 0, l_spread = 0;
     switch (anim) {
     case ANIM_WALK: leg_sw = sinf(t) * 0.55f; bob = fabsf(cosf(t)) * 0.03f; break;
@@ -135,10 +280,9 @@ void draw_human(human_model_t m, vec3_t pos, float yaw, anim_t anim, float t, fl
     case ANIM_HURT: lean = -0.3f; r_spread = -0.5f; l_spread = 0.5f; break;
     default: break;
     }
-    arm_sw = -leg_sw * 0.8f;
-    r_arm = arm_sw; l_arm = -arm_sw;
+    r_arm = -leg_sw * 0.8f;
+    l_arm = leg_sw * 0.8f;
     if (anim == ANIM_SWING) {
-        /* t: 0..1 progress of an overhead strike */
         float k = clampf(t, 0, 1);
         r_arm = -2.6f + k * 3.2f;
         lean = 0.15f * k;
@@ -148,252 +292,175 @@ void draw_human(human_model_t m, vec3_t pos, float yaw, anim_t anim, float t, fl
         r_arm = -2.8f; r_spread = -0.3f + sinf(t * 6.0f) * 0.35f;
     }
 
+    flash_begin(flash);
     glPushMatrix();
-    glTranslatef(pos.x, pos.y + bob, pos.z);
-    glRotatef(yaw * RAD2DEG, 0, 1, 0);
-    if (lean != 0) glRotatef(lean * RAD2DEG, 1, 0, 0);
-
-    /* legs + shoes */
+    mult_trs(pos.x, pos.y + bob, pos.z, lean, yaw, 0, 1.0f);
+    dl_call(L->body);
     for (int side = -1; side <= 1; side += 2) {
-        float sw = side < 0 ? leg_sw : -leg_sw;
         glPushMatrix();
-        glTranslatef(side * torso_w * 0.24f, hip_y, 0);
-        glRotatef(sw * RAD2DEG, 1, 0, 0);
-        part(PRIM_CUBE, d->bottom, 0, -leg_len * 0.45f, 0, limb_w * 1.1f, leg_len * 0.9f, limb_w * 1.15f);
-        part(PRIM_CUBE, d->shoes, 0, -leg_len + 0.04f, 0.03f, limb_w * 1.2f, 0.09f, limb_w * 1.7f);
+        mult_joint(side * L->leg_x, L->hip_y, 0, 0, side < 0 ? leg_sw : -leg_sw);
+        dl_call(L->leg);
         glPopMatrix();
     }
-
-    /* lower outfit */
-    switch (d->outfit) {
-    case OUT_ROBE:
-        part(PRIM_FRUSTUM, d->top, 0, hip_y * 0.25f, 0, torso_w * 1.5f, hip_y * 0.85f, torso_d * 2.2f);
-        break;
-    case OUT_DRESS:
-        part(PRIM_FRUSTUM, d->bottom, 0, hip_y * 0.12f, 0, torso_w * 1.9f, hip_y * 0.95f, torso_d * 2.8f);
-        break;
-    case OUT_MAID:
-        part(PRIM_FRUSTUM, d->bottom, 0, hip_y * 0.15f, 0, torso_w * 1.8f, hip_y * 0.92f, torso_d * 2.6f);
-        part(PRIM_CUBE, d->accent, 0, hip_y * 0.55f, torso_d * 0.62f, torso_w * 0.8f, hip_y * 0.7f, 0.02f);
-        break;
-    default:
-        part(PRIM_CUBE, d->bottom, 0, hip_y - 0.02f, 0, torso_w * 1.02f, 0.12f, torso_d * 1.05f);
-        break;
-    }
-
-    /* torso */
-    part(PRIM_CUBE, d->top, 0, hip_y + torso_h * 0.5f, 0, torso_w, torso_h, torso_d);
-    if (d->outfit == OUT_VEST)
-        part(PRIM_CUBE, d->accent, 0, hip_y + torso_h * 0.5f, 0, torso_w * 1.06f, torso_h * 0.8f, torso_d * 1.1f);
-    if (d->outfit == OUT_ROBE)
-        part(PRIM_CUBE, d->accent, 0, sh_y, 0.01f, torso_w * 0.9f, 0.06f, torso_d * 1.15f);
-    /* belt */
-    part(PRIM_CUBE, 0x3A2A1AFF, 0, hip_y + 0.02f, 0, torso_w * 1.04f, 0.05f, torso_d * 1.08f);
-
-    /* arms (+ weapon in right hand) */
-    for (int side = -1; side <= 1; side += 2) {
-        bool right = side < 0;   /* model faces +Z, so -X is its right hand */
-        float sw = right ? r_arm : l_arm;
-        float sp = right ? r_spread : l_spread;
-        glPushMatrix();
-        glTranslatef(side * (torso_w * 0.5f + limb_w * 0.55f), sh_y, 0);
-        if (sp != 0) glRotatef(sp * RAD2DEG * side * -1.0f, 0, 0, 1);
-        glRotatef(sw * RAD2DEG, 1, 0, 0);
-        uint32_t sleeve = d->outfit == OUT_VEST ? d->top : (d->outfit == OUT_MAID ? d->top : d->top);
-        part(PRIM_CUBE, sleeve, 0, -arm_len * 0.4f, 0, limb_w, arm_len * 0.8f, limb_w);
-        part(PRIM_CUBE, d->skin, 0, -arm_len * 0.9f, 0, limb_w * 0.9f, arm_len * 0.22f, limb_w * 0.9f);
-        if (right) draw_weapon(d, arm_len, H, anim);
-        glPopMatrix();
-    }
-
-    /* head */
-    part(PRIM_SPHERE, d->skin, 0, head_y, 0, head * 0.9f, head, head * 0.92f);
-    /* eyes */
-    float ey = head_y + head * 0.02f, ez = head * 0.42f, ex = head * 0.18f;
-    part(PRIM_CUBE, d->eyes, ex, ey, ez, head * 0.1f, head * 0.16f, 0.03f);
-    part(PRIM_CUBE, d->eyes, -ex, ey, ez, head * 0.1f, head * 0.16f, 0.03f);
-    if (d->elf_ears) {
-        part_r(PRIM_CONE, d->skin, head * 0.45f, head_y, 0, 0, 0, -1.3f, 0.07f, head * 0.35f, 0.05f);
-        part_r(PRIM_CONE, d->skin, -head * 0.45f, head_y, 0, 0, 0, 1.3f, 0.07f, head * 0.35f, 0.05f);
-    }
-    if (d->gem)
-        part(PRIM_OCTA, 0xFF3030FF, 0, head_y + head * 0.28f, head * 0.44f, 0.07f, 0.09f, 0.05f);
-
-    /* hair */
-    if (d->hair_style != HS_BALD) {
-        part(PRIM_SPHERE, d->hair, 0, head_y + head * 0.1f, -head * 0.08f, head * 0.98f, head * 0.92f, head);
-        switch (d->hair_style) {
-        case HS_SPIKY:
-            for (int i = -1; i <= 1; i++)
-                part_r(PRIM_CONE, d->hair, i * head * 0.25f, head_y + head * 0.3f, -head * 0.2f,
-                       -1.0f, 0, i * 0.4f, head * 0.3f, head * 0.45f, head * 0.3f);
-            break;
-        case HS_LONG:
-            part(PRIM_CUBE, d->hair, 0, head_y - head * 0.45f, -head * 0.32f, head * 0.85f, head * 1.3f, head * 0.3f);
-            break;
-        case HS_BRAIDS:
-            for (int s = -1; s <= 1; s += 2) {
-                part(PRIM_CYLINDER, d->hair, s * head * 0.42f, head_y - head * 1.25f, -head * 0.1f,
-                     head * 0.2f, head * 1.25f, head * 0.2f);
-                part(PRIM_SPHERE, d->accent, s * head * 0.42f, head_y - head * 1.27f, -head * 0.1f,
-                     head * 0.16f, head * 0.12f, head * 0.16f);
-            }
-            break;
-        case HS_PONY:
-            part_r(PRIM_CONE, d->hair, 0, head_y + head * 0.15f, -head * 0.5f, 2.6f, 0, 0,
-                   head * 0.35f, head * 1.0f, head * 0.35f);
-            break;
-        case HS_BUN:
-            part(PRIM_SPHERE, d->hair, 0, head_y + head * 0.25f, -head * 0.5f, head * 0.45f, head * 0.45f, head * 0.45f);
-            break;
-        default:
-            break;
-        }
-    }
-
-    switch (d->hat) {
-    case HAT_WITCH:
-        part(PRIM_DISC, 0x4A3222FF, 0, head_y + head * 0.4f, -head * 0.05f, head * 2.3f, 1, head * 2.3f);
-        part_r(PRIM_CONE, 0x5A3E2BFF, 0, head_y + head * 0.38f, -head * 0.08f, -0.25f, 0, 0,
-               head * 1.05f, head * 1.25f, head * 1.05f);
-        part(PRIM_CYLINDER, 0xD8C890FF, 0, head_y + head * 0.4f, -head * 0.06f, head * 1.07f, head * 0.12f, head * 1.07f);
-        break;
-    case HAT_BAND:
-        part(PRIM_CYLINDER, 0x6A2A2AFF, 0, head_y + head * 0.12f, 0, head * 0.95f, head * 0.12f, head * 0.97f);
-        break;
-    default:
-        break;
-    }
-
+    /* the model faces +Z, so its right hand is on -X */
+    glPushMatrix();
+    mult_joint(-L->arm_x, L->sh_y, 0, r_spread, r_arm);
+    dl_call(anim == ANIM_CAST ? L->arm_r_cast : L->arm_r);
     glPopMatrix();
-    cur_flash = 0;
+    glPushMatrix();
+    mult_joint(L->arm_x, L->sh_y, 0, -l_spread, l_arm);
+    dl_call(L->arm_l);
+    glPopMatrix();
+    glPopMatrix();
+    flash_end(flash);
 }
 
 /* ------------------------------------------------------------------ */
 /* Creatures                                                           */
 /* ------------------------------------------------------------------ */
 
+static dlist_t wolf_body, wolf_leg, wolf_tail;
+static dlist_t boar_body[2], boar_leg[2], boar_tail[2];
+static dlist_t target_list;
+
+static void build_creatures(void)
+{
+    const uint32_t fur = 0x76767EFF, dark = 0x4A4A54FF, belly = 0xB8B8C0FF;
+    begin_list();
+    P(PRIM_CUBE, fur, 0, 0.62f, 0, 0.42f, 0.4f, 1.0f);
+    P(PRIM_CUBE, belly, 0, 0.47f, 0.05f, 0.34f, 0.12f, 0.8f);
+    P(PRIM_CUBE, dark, 0, 0.84f, -0.05f, 0.2f, 0.08f, 0.8f);
+    P(PRIM_CUBE, fur, 0, 0.82f, 0.62f, 0.36f, 0.34f, 0.36f);
+    P(PRIM_CUBE, belly, 0, 0.74f, 0.86f, 0.2f, 0.16f, 0.28f);
+    P(PRIM_CUBE, 0x202020FF, 0, 0.78f, 1.0f, 0.08f, 0.07f, 0.04f);
+    P(PRIM_QUAD, 0xFFD040FF, 0.1f, 0.88f, 0.805f, 0.06f, 0.05f, 1);
+    P(PRIM_QUAD, 0xFFD040FF, -0.1f, 0.88f, 0.805f, 0.06f, 0.05f, 1);
+    P(PRIM_CONE, dark, 0.11f, 0.98f, 0.55f, 0.12f, 0.2f, 0.08f);
+    P(PRIM_CONE, dark, -0.11f, 0.98f, 0.55f, 0.12f, 0.2f, 0.08f);
+    wolf_body = end_list();
+    begin_list();
+    P(PRIM_SBOX, dark, 0, -0.24f, 0, 0.11f, 0.48f, 0.12f);
+    wolf_leg = end_list();
+    begin_list();
+    P(PRIM_CYLINDER, fur, 0, 0, 0, 0.12f, 0.5f, 0.12f);
+    wolf_tail = end_list();
+
+    for (int boss = 0; boss < 2; boss++) {
+        uint32_t hide = boss ? 0x5A2A22FF : 0x6B4A30FF;
+        uint32_t mane = boss ? 0x2A1410FF : 0x3E2A1CFF;
+        uint32_t eye = boss ? 0xFF3020FF : 0x201010FF;
+        begin_list();
+        P(PRIM_SPHERE, hide, 0, 0.62f, 0, 0.8f, 0.72f, 1.25f);
+        for (int i = 0; i < 4; i++)
+            PR(PRIM_CONE, mane, 0, 0.92f, 0.3f - i * 0.2f, -0.4f, 0, 0, 0.14f, 0.22f, 0.14f);
+        P(PRIM_CUBE, hide, 0, 0.56f, 0.64f, 0.48f, 0.42f, 0.42f);
+        PR(PRIM_CYLINDER, 0xC08070FF, 0, 0.5f, 0.8f, 1.5708f, 0, 0, 0.24f, 0.14f, 0.2f);
+        P(PRIM_QUAD, eye, 0.14f, 0.66f, 0.855f, 0.07f, 0.06f, 1);
+        P(PRIM_QUAD, eye, -0.14f, 0.66f, 0.855f, 0.07f, 0.06f, 1);
+        PR(PRIM_CONE, 0xF0ECDCFF, 0.18f, 0.44f, 0.86f, 0.9f, 0, -0.4f, 0.07f, 0.28f, 0.07f);
+        PR(PRIM_CONE, 0xF0ECDCFF, -0.18f, 0.44f, 0.86f, 0.9f, 0, 0.4f, 0.07f, 0.28f, 0.07f);
+        P(PRIM_CONE, mane, 0.18f, 0.76f, 0.56f, 0.12f, 0.18f, 0.08f);
+        P(PRIM_CONE, mane, -0.18f, 0.76f, 0.56f, 0.12f, 0.18f, 0.08f);
+        boar_body[boss] = end_list();
+        begin_list();
+        P(PRIM_SBOX, mane, 0, -0.19f, 0, 0.15f, 0.38f, 0.16f);
+        boar_leg[boss] = end_list();
+        begin_list();
+        P(PRIM_CYLINDER, mane, 0, 0, 0, 0.06f, 0.25f, 0.06f);
+        boar_tail[boss] = end_list();
+    }
+
+    begin_list();
+    P(PRIM_CYLINDER, 0x7A5432FF, 0, 0, 0, 0.14f, 1.7f, 0.14f);
+    P(PRIM_CYLINDER, 0xD8C070FF, 0, 0.6f, 0, 0.55f, 0.75f, 0.45f);
+    P(PRIM_CUBE, 0xD8C070FF, 0, 1.05f, 0, 0.9f, 0.14f, 0.18f);
+    P(PRIM_SPHERE, 0xD8C070FF, 0, 1.6f, 0, 0.42f, 0.42f, 0.42f);
+    PR(PRIM_DISC, 0xF4F0E8FF, 0, 0.95f, 0.24f, 1.5708f, 0, 0, 0.42f, 1, 0.42f);
+    PR(PRIM_DISC, 0xD03030FF, 0, 0.95f, 0.25f, 1.5708f, 0, 0, 0.28f, 1, 0.28f);
+    PR(PRIM_DISC, 0xF4F0E8FF, 0, 0.95f, 0.26f, 1.5708f, 0, 0, 0.14f, 1, 0.14f);
+    target_list = end_list();
+}
+
+void models_init(void)
+{
+    for (int m = 0; m < MDL_HUMAN_COUNT; m++) build_human((human_model_t)m);
+    build_creatures();
+}
+
+static void draw_quadruped(dlist_t body, dlist_t leg, dlist_t tail, vec3_t pos, float yaw, float scale,
+                           float t, bool moving, float flash, float leg_dx, float leg_dz, float hip_y,
+                           vec3_t tail_at, float tail_rx)
+{
+    float sw = moving ? sinf(t) * 0.55f : 0;
+    flash_begin(flash);
+    if (scale != 1.0f) glEnable(GL_NORMALIZE);
+    glPushMatrix();
+    mult_trs(pos.x, pos.y, pos.z, 0, yaw, 0, scale);
+    dl_call(body);
+    for (int i = 0; i < 4; i++) {
+        float lx = (i & 1) ? leg_dx : -leg_dx;
+        float lz = (i & 2) ? leg_dz : -leg_dz;
+        glPushMatrix();
+        mult_joint(lx, hip_y, lz, 0, (i == 0 || i == 3) ? sw : -sw);
+        dl_call(leg);
+        glPopMatrix();
+    }
+    glPushMatrix();
+    mult_joint(tail_at.x, tail_at.y, tail_at.z, 0, tail_rx);
+    dl_call(tail);
+    glPopMatrix();
+    glPopMatrix();
+    if (scale != 1.0f) glDisable(GL_NORMALIZE);
+    flash_end(flash);
+}
+
 void draw_wolf(vec3_t pos, float yaw, float t, bool moving, float flash, float scale)
 {
-    cur_flash = flash;
-    const uint32_t fur = 0x76767EFF, dark = 0x4A4A54FF, belly = 0xB8B8C0FF;
-    float sw = moving ? sinf(t) * 0.6f : 0;
-    glPushMatrix();
-    glTranslatef(pos.x, pos.y, pos.z);
-    glRotatef(yaw * RAD2DEG, 0, 1, 0);
-    glScalef(scale, scale, scale);
-
-    part(PRIM_CUBE, fur, 0, 0.62f, 0, 0.42f, 0.4f, 1.0f);
-    part(PRIM_CUBE, belly, 0, 0.47f, 0.05f, 0.34f, 0.12f, 0.8f);
-    part(PRIM_CUBE, dark, 0, 0.84f, -0.05f, 0.2f, 0.08f, 0.8f);
-    /* head */
-    part(PRIM_CUBE, fur, 0, 0.82f, 0.62f, 0.36f, 0.34f, 0.36f);
-    part(PRIM_CUBE, belly, 0, 0.74f, 0.86f, 0.2f, 0.16f, 0.28f);
-    part(PRIM_CUBE, 0x202020FF, 0, 0.78f, 1.0f, 0.08f, 0.07f, 0.04f);
-    part(PRIM_CUBE, 0xFFD040FF, 0.1f, 0.88f, 0.8f, 0.06f, 0.05f, 0.03f);
-    part(PRIM_CUBE, 0xFFD040FF, -0.1f, 0.88f, 0.8f, 0.06f, 0.05f, 0.03f);
-    part(PRIM_CONE, dark, 0.11f, 0.98f, 0.55f, 0.12f, 0.2f, 0.08f);
-    part(PRIM_CONE, dark, -0.11f, 0.98f, 0.55f, 0.12f, 0.2f, 0.08f);
-    /* tail */
-    part_r(PRIM_CYLINDER, fur, 0, 0.7f, -0.48f, -2.2f + sinf(t * 2) * 0.2f, 0, 0, 0.12f, 0.5f, 0.12f);
-    /* legs */
-    for (int i = 0; i < 4; i++) {
-        float lx = (i & 1) ? 0.14f : -0.14f;
-        float lz = (i & 2) ? 0.36f : -0.36f;
-        float s = ((i == 0 || i == 3) ? sw : -sw);
-        limb(dark, lx, 0.48f, lz, s, 0, 0.11f, 0.48f, 0.12f);
-    }
-    glPopMatrix();
-    cur_flash = 0;
+    draw_quadruped(wolf_body, wolf_leg, wolf_tail, pos, yaw, scale, t, moving, flash,
+                   0.14f, 0.36f, 0.48f, v3(0, 0.7f, -0.48f), -2.2f + sinf(t * 2) * 0.2f);
 }
 
 void draw_boar(vec3_t pos, float yaw, float t, bool moving, float flash, float scale, bool boss)
 {
-    cur_flash = flash;
-    uint32_t hide = boss ? 0x5A2A22FF : 0x6B4A30FF;
-    uint32_t mane = boss ? 0x2A1410FF : 0x3E2A1CFF;
-    uint32_t eye = boss ? 0xFF3020FF : 0x201010FF;
-    float sw = moving ? sinf(t) * 0.5f : 0;
-    glPushMatrix();
-    glTranslatef(pos.x, pos.y, pos.z);
-    glRotatef(yaw * RAD2DEG, 0, 1, 0);
-    glScalef(scale, scale, scale);
-
-    part(PRIM_SPHERE, hide, 0, 0.62f, 0, 0.8f, 0.72f, 1.25f);
-    for (int i = 0; i < 4; i++)
-        part_r(PRIM_CONE, mane, 0, 0.92f, 0.3f - i * 0.2f, -0.4f, 0, 0, 0.14f, 0.22f, 0.14f);
-    /* head */
-    part(PRIM_CUBE, hide, 0, 0.56f, 0.64f, 0.48f, 0.42f, 0.42f);
-    part_r(PRIM_CYLINDER, 0xC08070FF, 0, 0.5f, 0.8f, 1.5708f, 0, 0, 0.24f, 0.14f, 0.2f);
-    part(PRIM_CUBE, eye, 0.14f, 0.66f, 0.84f, 0.07f, 0.06f, 0.03f);
-    part(PRIM_CUBE, eye, -0.14f, 0.66f, 0.84f, 0.07f, 0.06f, 0.03f);
-    /* tusks */
-    part_r(PRIM_CONE, 0xF0ECDCFF, 0.18f, 0.44f, 0.86f, 0.9f, 0, -0.4f, 0.07f, 0.28f, 0.07f);
-    part_r(PRIM_CONE, 0xF0ECDCFF, -0.18f, 0.44f, 0.86f, 0.9f, 0, 0.4f, 0.07f, 0.28f, 0.07f);
-    /* ears */
-    part(PRIM_CONE, mane, 0.18f, 0.76f, 0.56f, 0.12f, 0.18f, 0.08f);
-    part(PRIM_CONE, mane, -0.18f, 0.76f, 0.56f, 0.12f, 0.18f, 0.08f);
-    /* legs */
-    for (int i = 0; i < 4; i++) {
-        float lx = (i & 1) ? 0.22f : -0.22f;
-        float lz = (i & 2) ? 0.38f : -0.38f;
-        float s = ((i == 0 || i == 3) ? sw : -sw);
-        limb(mane, lx, 0.38f, lz, s, 0, 0.15f, 0.38f, 0.16f);
-    }
-    part_r(PRIM_CYLINDER, mane, 0, 0.7f, -0.6f, -2.0f, 0, 0, 0.06f, 0.25f, 0.06f);
-    glPopMatrix();
-    cur_flash = 0;
+    int b = boss ? 1 : 0;
+    draw_quadruped(boar_body[b], boar_leg[b], boar_tail[b], pos, yaw, scale, t, moving, flash,
+                   0.22f, 0.38f, 0.38f, v3(0, 0.7f, -0.6f), -2.0f);
 }
 
 void draw_target(vec3_t pos, float yaw, float flash)
 {
-    cur_flash = flash;
+    flash_begin(flash);
     glPushMatrix();
-    glTranslatef(pos.x, pos.y, pos.z);
-    glRotatef(yaw * RAD2DEG, 0, 1, 0);
-    part(PRIM_CYLINDER, 0x7A5432FF, 0, 0, 0, 0.14f, 1.7f, 0.14f);
-    part(PRIM_CYLINDER, 0xD8C070FF, 0, 0.6f, 0, 0.55f, 0.75f, 0.45f);
-    part(PRIM_CUBE, 0xD8C070FF, 0, 1.05f, 0, 0.9f, 0.14f, 0.18f);
-    part(PRIM_SPHERE, 0xD8C070FF, 0, 1.6f, 0, 0.42f, 0.42f, 0.42f);
-    /* painted target on the chest */
-    part_r(PRIM_DISC, 0xF4F0E8FF, 0, 0.95f, 0.24f, 1.5708f, 0, 0, 0.42f, 1, 0.42f);
-    part_r(PRIM_DISC, 0xD03030FF, 0, 0.95f, 0.25f, 1.5708f, 0, 0, 0.28f, 1, 0.28f);
-    part_r(PRIM_DISC, 0xF4F0E8FF, 0, 0.95f, 0.26f, 1.5708f, 0, 0, 0.14f, 1, 0.14f);
+    mult_trs(pos.x, pos.y, pos.z, 0, yaw, 0, 1.0f);
+    dl_call(target_list);
     glPopMatrix();
-    cur_flash = 0;
+    flash_end(flash);
 }
 
 void draw_wisp(vec3_t pos, float t, float flash)
 {
-    cur_flash = flash;
     glDisable(GL_LIGHTING);
     float p = 1.0f + sinf(t * 5.0f) * 0.1f;
-    part(PRIM_SPHERE, 0xC070FFFF, pos.x, pos.y, pos.z, 0.55f * p, 0.55f * p, 0.55f * p);
-    part(PRIM_SPHERE, 0xFFE8FFFF, pos.x, pos.y, pos.z, 0.3f, 0.3f, 0.3f);
+    uint32_t outer = flash > 0 ? 0xFFE0FFFF : 0xC070FFFF;
+    gfx_part(PRIM_SPHERE, outer, pos.x, pos.y, pos.z, 0.55f * p, 0.55f * p, 0.55f * p);
     for (int i = 0; i < 3; i++) {
         float a = t * 3.0f + i * TAU_F / 3;
-        part(PRIM_OCTA, 0xE0A0FFFF, pos.x + cosf(a) * 0.6f, pos.y + sinf(a * 2) * 0.15f, pos.z + sinf(a) * 0.6f,
-             0.16f, 0.22f, 0.16f);
+        gfx_part(PRIM_OCTA, 0xE0A0FFFF, pos.x + cosf(a) * 0.6f, pos.y + sinf(a * 2) * 0.15f, pos.z + sinf(a) * 0.6f,
+                 0.16f, 0.22f, 0.16f);
     }
     glEnable(GL_LIGHTING);
-    cur_flash = 0;
 }
 
 void draw_crystal(vec3_t pos, float t, float flash, float scale)
 {
-    cur_flash = flash;
+    flash_begin(flash);
     glPushMatrix();
-    glTranslatef(pos.x, pos.y + sinf(t * 1.7f) * 0.15f, pos.z);
-    glRotatef(t * 40.0f, 0, 1, 0);
-    glScalef(scale, scale, scale);
-    part(PRIM_OCTA, 0x9A50E0FF, 0, 1.2f, 0, 1.0f, 2.0f, 1.0f);
-    glDisable(GL_LIGHTING);
-    part(PRIM_OCTA, 0xF0C8FFFF, 0, 1.2f, 0, 0.45f, 1.1f, 0.45f);
-    glEnable(GL_LIGHTING);
+    mult_trs(pos.x, pos.y + sinf(t * 1.7f) * 0.15f, pos.z, 0, t * 0.7f, 0, scale);
+    gfx_part(PRIM_OCTA, 0x9A50E0FF, 0, 1.2f, 0, 1.0f, 2.0f, 1.0f);
     for (int i = 0; i < 4; i++) {
         float a = i * TAU_F / 4 + t;
-        part(PRIM_OCTA, 0x7A40C0FF, cosf(a) * 0.9f, 0.4f, sinf(a) * 0.9f, 0.3f, 0.6f, 0.3f);
+        gfx_part(PRIM_OCTA, 0x7A40C0FF, cosf(a) * 0.9f, 0.4f, sinf(a) * 0.9f, 0.3f, 0.6f, 0.3f);
     }
     glPopMatrix();
-    cur_flash = 0;
+    flash_end(flash);
 }
